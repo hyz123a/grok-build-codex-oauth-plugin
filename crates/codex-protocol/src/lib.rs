@@ -254,6 +254,8 @@ impl Default for TransformOptions {
                 "low".into(),
                 "medium".into(),
                 "high".into(),
+                "xhigh".into(),
+                "max".into(),
             ],
             default_reasoning_effort: "high".into(),
         }

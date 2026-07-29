@@ -102,6 +102,15 @@ fn dynamic_catalog_replaces_stale_managed_aliases_and_preserves_user_models() {
             model: "gpt-5.7".into(),
             display_name: "Codex GPT-5.7".into(),
             context_window: Some(300_000),
+            default_reasoning_effort: Some("medium".into()),
+            supported_reasoning_efforts: vec![
+                "low".into(),
+                "medium".into(),
+                "high".into(),
+                "xhigh".into(),
+                "max".into(),
+                "ultra".into(),
+            ],
         }],
         &["codex-old".into()],
     )
@@ -113,6 +122,11 @@ fn dynamic_catalog_replaces_stale_managed_aliases_and_preserves_user_models() {
     assert!(result.contains("[model.codex-gpt-5-7]"));
     assert!(result.contains("model = \"gpt-5.7\""));
     assert!(result.contains("context_window = 300000"));
+    assert!(result.contains("supports_reasoning_effort = true"));
+    assert!(result.contains("reasoning_effort = \"medium\""));
+    assert!(result.contains("value = \"xhigh\""));
+    assert!(result.contains("value = \"max\""));
+    assert!(!result.contains("value = \"ultra\""));
     assert_eq!(
         installed,
         vec!["codex".to_string(), "codex-gpt-5-7".to_string()]

@@ -21,7 +21,16 @@ fn catalog_keeps_only_visible_api_models_and_sorts_by_priority() {
                     "visibility": "list",
                     "supported_in_api": true,
                     "priority": 2,
-                    "context_window": 300000
+                    "context_window": 300000,
+                    "default_reasoning_level": "medium",
+                    "supported_reasoning_levels": [
+                        {"effort": "low"},
+                        {"effort": "medium"},
+                        {"effort": "high"},
+                        {"effort": "xhigh"},
+                        {"effort": "max"},
+                        {"effort": "ultra"}
+                    ]
                 },
                 {
                     "slug": "hidden-preview",
@@ -57,11 +66,22 @@ fn catalog_keeps_only_visible_api_models_and_sorts_by_priority() {
                 slug: "gpt-5.7-mini".into(),
                 display_name: "GPT-5.7 Mini".into(),
                 context_window: None,
+                default_reasoning_effort: None,
+                supported_reasoning_efforts: Vec::new(),
             },
             CatalogModel {
                 slug: "gpt-5.7".into(),
                 display_name: "GPT-5.7".into(),
                 context_window: Some(300_000),
+                default_reasoning_effort: Some("medium".into()),
+                supported_reasoning_efforts: vec![
+                    "low".into(),
+                    "medium".into(),
+                    "high".into(),
+                    "xhigh".into(),
+                    "max".into(),
+                    "ultra".into(),
+                ],
             },
         ]
     );
@@ -145,6 +165,8 @@ fn cached_catalog_round_trips_with_private_permissions() {
         slug: "gpt-5.7".into(),
         display_name: "GPT-5.7".into(),
         context_window: Some(300_000),
+        default_reasoning_effort: Some("medium".into()),
+        supported_reasoning_efforts: vec!["low".into(), "medium".into(), "high".into()],
     }];
 
     save_cached_catalog(&path, &models).expect("save cache");

@@ -59,6 +59,18 @@ fn transform_preserves_function_call_pairing_and_deduplicates_include() {
 }
 
 #[test]
+fn transform_preserves_xhigh_and_max_reasoning_efforts() {
+    for effort in ["xhigh", "max"] {
+        let transformed = transform_responses_request(
+            json!({"reasoning": {"effort": effort}}),
+            &TransformOptions::default(),
+        )
+        .expect("transform");
+        assert_eq!(transformed["reasoning"]["effort"], effort);
+    }
+}
+
+#[test]
 fn transform_moves_system_messages_to_top_level_instructions() {
     let request = json!({
         "instructions": "Existing bridge instruction.",

@@ -21,6 +21,10 @@ pub struct CatalogModel {
     pub display_name: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub context_window: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub default_reasoning_effort: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub supported_reasoning_efforts: Vec<String>,
 }
 
 #[derive(Deserialize)]
@@ -39,6 +43,15 @@ struct RemoteModel {
     priority: i32,
     #[serde(default)]
     context_window: Option<i64>,
+    #[serde(default)]
+    default_reasoning_level: Option<String>,
+    #[serde(default)]
+    supported_reasoning_levels: Vec<RemoteReasoningLevel>,
+}
+
+#[derive(Deserialize)]
+struct RemoteReasoningLevel {
+    effort: String,
 }
 
 pub fn parse_visible_models(bytes: &[u8]) -> Result<Vec<CatalogModel>, CatalogError> {
@@ -58,6 +71,12 @@ pub fn parse_visible_models(bytes: &[u8]) -> Result<Vec<CatalogModel>, CatalogEr
             slug: model.slug,
             display_name: model.display_name,
             context_window: model.context_window,
+            default_reasoning_effort: model.default_reasoning_level,
+            supported_reasoning_efforts: model
+                .supported_reasoning_levels
+                .into_iter()
+                .map(|level| level.effort)
+                .collect(),
         })
         .collect())
 }

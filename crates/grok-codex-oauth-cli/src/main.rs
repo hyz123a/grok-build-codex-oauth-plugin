@@ -278,6 +278,8 @@ fn install_discovered_models(
             model: model.slug.clone(),
             display_name: format!("Codex {}", model.display_name),
             context_window: model.context_window,
+            default_reasoning_effort: model.default_reasoning_effort.clone(),
+            supported_reasoning_efforts: model.supported_reasoning_efforts.clone(),
         })
         .collect::<Vec<_>>();
     replace_model_catalog(path, config, &selectable, previous_aliases).map_err(Into::into)

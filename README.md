@@ -45,6 +45,7 @@ Inside Grok:
 ```text
 /codex-oauth:status
 /model
+/effort high
 ```
 
 For a headless machine:
@@ -75,6 +76,10 @@ logs.
 API-supported model to Grok's `/model` picker. A successful result is cached at
 `~/.grok/codex-oauth/models-cache.json`. If the endpoint is temporarily unavailable, sync uses the
 last cache; on a first-run offline machine it uses the built-in catalog.
+
+The sync also installs each model's reasoning-effort menu and default. Grok 0.2.114 supports
+`low`, `medium`, `high`, `xhigh`, and `max`; a backend-only `ultra` level is omitted until Grok can
+represent it.
 
 ## Test architecture
 

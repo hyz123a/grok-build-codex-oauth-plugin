@@ -8,7 +8,10 @@ use std::{
 
 use rand::RngCore;
 use thiserror::Error;
-use toml_edit::{DocumentMut, Item, Table, value};
+use toml_edit::{Array, DocumentMut, InlineTable, Item, Table, Value, value};
+
+const GROK_REASONING_EFFORTS: &[&str] =
+    &["none", "minimal", "low", "medium", "high", "xhigh", "max"];
 
 pub const MANAGED_MODEL_ALIASES: &[&str] = &[
     "codex",
@@ -33,6 +36,8 @@ pub struct SelectableModel {
     pub model: String,
     pub display_name: String,
     pub context_window: Option<i64>,
+    pub default_reasoning_effort: Option<String>,
+    pub supported_reasoning_efforts: Vec<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -119,6 +124,8 @@ pub fn install_model_catalog(path: &Path, config: &ModelConfig) -> Result<(), Co
             model: (*model).into(),
             display_name: (*display_name).into(),
             context_window: None,
+            default_reasoning_effort: None,
+            supported_reasoning_efforts: Vec::new(),
         })
         .collect::<Vec<_>>();
     replace_model_catalog(path, config, &catalog, &[]).map(|_| ())
@@ -141,27 +148,21 @@ pub fn replace_model_catalog(
             models.remove(alias);
         }
     }
-    upsert_model_table(
-        models,
-        "codex",
-        &config.model,
-        "Codex via ChatGPT OAuth",
-        None,
-        config,
-    )?;
+    let default_model = SelectableModel {
+        alias: "codex".into(),
+        model: config.model.clone(),
+        display_name: "Codex via ChatGPT OAuth".into(),
+        context_window: None,
+        default_reasoning_effort: None,
+        supported_reasoning_efforts: Vec::new(),
+    };
+    upsert_model_table(models, &default_model, config)?;
     let mut installed = vec!["codex".to_string()];
     for selectable in catalog {
         if selectable.alias == "codex" || installed.contains(&selectable.alias) {
             continue;
         }
-        upsert_model_table(
-            models,
-            &selectable.alias,
-            &selectable.model,
-            &selectable.display_name,
-            selectable.context_window,
-            config,
-        )?;
+        upsert_model_table(models, selectable, config)?;
         installed.push(selectable.alias.clone());
     }
     persist_if_changed(path, &original, &document.to_string())?;
@@ -195,25 +196,75 @@ pub fn uninstall_model_aliases(path: &Path, aliases: &[String]) -> Result<(), Co
 
 fn upsert_model_table(
     models: &mut Table,
-    alias: &str,
-    model: &str,
-    display_name: &str,
-    context_window: Option<i64>,
+    selectable: &SelectableModel,
     config: &ModelConfig,
 ) -> Result<(), ConfigError> {
+    let alias = &selectable.alias;
     if !models.contains_key(alias) {
         models.insert(alias, Item::Table(Table::new()));
     }
     let entry = models[alias]
         .as_table_mut()
         .ok_or_else(|| ConfigError::ConflictingModel(alias.to_string()))?;
-    entry["model"] = value(model);
+    entry["model"] = value(&selectable.model);
     entry["base_url"] = value(format!("http://127.0.0.1:{}/v1", config.port));
-    entry["name"] = value(display_name);
+    entry["name"] = value(&selectable.display_name);
     entry["api_backend"] = value("responses");
     entry["api_key"] = value(&config.local_secret);
-    entry["context_window"] = value(context_window.unwrap_or(config.context_window));
+    entry["context_window"] = value(selectable.context_window.unwrap_or(config.context_window));
+    write_reasoning_config(
+        entry,
+        selectable.default_reasoning_effort.as_deref(),
+        &selectable.supported_reasoning_efforts,
+    );
     Ok(())
+}
+
+fn write_reasoning_config(
+    entry: &mut Table,
+    default_reasoning_effort: Option<&str>,
+    supported_reasoning_efforts: &[String],
+) {
+    let supported = supported_reasoning_efforts
+        .iter()
+        .map(String::as_str)
+        .filter(|effort| GROK_REASONING_EFFORTS.contains(effort))
+        .collect::<Vec<_>>();
+    if supported.is_empty() {
+        entry.remove("supports_reasoning_effort");
+        entry.remove("reasoning_effort");
+        entry.remove("reasoning_efforts");
+        return;
+    }
+
+    let default = default_reasoning_effort
+        .filter(|effort| supported.contains(effort))
+        .unwrap_or(supported[0]);
+    entry["supports_reasoning_effort"] = value(true);
+    entry["reasoning_effort"] = value(default);
+    let mut options = Array::new();
+    for effort in supported {
+        let mut option = InlineTable::new();
+        option.insert("id", Value::from(effort));
+        option.insert("value", Value::from(effort));
+        option.insert("label", Value::from(reasoning_effort_label(effort)));
+        option.insert("default", Value::from(effort == default));
+        options.push(option);
+    }
+    entry["reasoning_efforts"] = value(options);
+}
+
+fn reasoning_effort_label(effort: &str) -> &'static str {
+    match effort {
+        "none" => "None",
+        "minimal" => "Minimal",
+        "low" => "Low",
+        "medium" => "Medium",
+        "high" => "High",
+        "xhigh" => "X high",
+        "max" => "Max",
+        _ => "Custom",
+    }
 }
 
 fn ensure_table(document: &mut DocumentMut, key: &'static str) -> Result<(), ConfigError> {
