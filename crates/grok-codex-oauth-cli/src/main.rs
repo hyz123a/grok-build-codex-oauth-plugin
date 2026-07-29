@@ -1,11 +1,11 @@
 use std::{
-    collections::HashMap,
+    collections::{HashMap, VecDeque},
     fs,
-    io::Write,
+    io::{BufRead, BufReader, Seek, SeekFrom, Write},
     net::SocketAddr,
     path::{Path, PathBuf},
     process::{Command, ExitCode, Stdio},
-    sync::Arc,
+    sync::{Arc, Mutex as StdMutex},
     time::Duration,
 };
 
@@ -33,10 +33,14 @@ use grok_config::{
 };
 use rand::RngCore;
 use tokio::sync::{Mutex, oneshot};
+use tracing_subscriber::fmt::MakeWriter;
 
 const DEFAULT_PORT: u16 = 1456;
 const DEFAULT_MODEL: &str = "gpt-5.4";
 const FALLBACK_CODEX_CLIENT_VERSION: &str = "0.145.0";
+const DEFAULT_LOG_LINES: usize = 100;
+const MAX_DAEMON_LOG_BYTES: u64 = 10 * 1024 * 1024;
+const DAEMON_LOG_BACKUPS: usize = 3;
 
 #[derive(Parser)]
 #[command(version, about = "ChatGPT/Codex OAuth companion for Grok Build")]
@@ -78,6 +82,9 @@ enum Commands {
     Serve {
         #[arg(long, default_value_t = DEFAULT_PORT)]
         port: u16,
+        /// Write daemon tracing through the size-limited rotating log writer.
+        #[arg(long, hide = true)]
+        daemon_log: Option<PathBuf>,
     },
     /// Start the daemon when configured and logged in.
     EnsureDaemon {
@@ -89,6 +96,21 @@ enum Commands {
         #[arg(long, default_value_t = DEFAULT_PORT)]
         port: u16,
     },
+    /// Show or follow proxy diagnostic logs.
+    Logs {
+        /// Continue printing new log lines.
+        #[arg(short, long)]
+        follow: bool,
+        /// Number of matching historical lines to show.
+        #[arg(short = 'n', long, default_value_t = DEFAULT_LOG_LINES)]
+        lines: usize,
+        /// Show only warnings, errors, and failed request outcomes.
+        #[arg(long)]
+        errors: bool,
+        /// Show only entries containing this client or upstream request ID.
+        #[arg(long)]
+        request_id: Option<String>,
+    },
 }
 
 #[derive(Subcommand)]
@@ -99,22 +121,62 @@ enum ModelsCommand {
 
 #[tokio::main]
 async fn main() -> ExitCode {
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| "grok_codex_oauth=info,codex_proxy=info".into()),
-        )
-        .with_target(false)
-        .without_time()
-        .init();
+    let cli = Cli::parse();
+    let daemon_logging = matches!(
+        &cli.command,
+        Commands::Serve {
+            daemon_log: Some(_),
+            ..
+        }
+    );
+    if let Err(error) = init_tracing(&cli) {
+        eprintln!("error: could not initialize logging: {error:#}");
+        return ExitCode::FAILURE;
+    }
 
-    match run(Cli::parse()).await {
+    match run(cli).await {
         Ok(()) => ExitCode::SUCCESS,
         Err(error) => {
-            eprintln!("error: {error:#}");
+            if daemon_logging {
+                tracing::error!(error = %format!("{error:#}"), "Codex OAuth daemon stopped");
+            } else {
+                eprintln!("error: {error:#}");
+            }
             ExitCode::FAILURE
         }
     }
+}
+
+fn init_tracing(cli: &Cli) -> Result<()> {
+    let daemon_log = match &cli.command {
+        Commands::Serve {
+            daemon_log: Some(path),
+            ..
+        } => Some(path),
+        _ => None,
+    };
+    if let Some(path) = daemon_log {
+        let writer =
+            RotatingLogWriter::new(path.clone(), MAX_DAEMON_LOG_BYTES, DAEMON_LOG_BACKUPS)?;
+        tracing_subscriber::fmt()
+            .with_env_filter(default_tracing_filter())
+            .with_target(false)
+            .with_ansi(false)
+            .with_writer(writer)
+            .init();
+    } else {
+        tracing_subscriber::fmt()
+            .with_env_filter(default_tracing_filter())
+            .with_target(false)
+            .with_ansi(false)
+            .init();
+    }
+    Ok(())
+}
+
+fn default_tracing_filter() -> tracing_subscriber::EnvFilter {
+    tracing_subscriber::EnvFilter::try_from_default_env()
+        .unwrap_or_else(|_| "grok_codex_oauth=info,codex_proxy=info".into())
 }
 
 async fn run(cli: Cli) -> Result<()> {
@@ -133,9 +195,15 @@ async fn run(cli: Cli) -> Result<()> {
             println!("Removed managed Codex models; other Grok settings were preserved.");
             Ok(())
         }
-        Commands::Serve { port } => serve(&paths, port).await,
+        Commands::Serve { port, .. } => serve(&paths, port).await,
         Commands::EnsureDaemon { port } => ensure_daemon(&paths, port).await,
         Commands::Doctor { port } => doctor(&paths, port).await,
+        Commands::Logs {
+            follow,
+            lines,
+            errors,
+            request_id,
+        } => logs(&paths, follow, lines, errors, request_id.as_deref()),
     }
 }
 
@@ -412,9 +480,7 @@ fn setup(paths: &AppPaths, model: &str, port: u16) -> Result<()> {
         }
     };
     install_model_catalog(&paths.grok_config, &ModelConfig::new(model, port, secret))?;
-    println!(
-        "Configured selectable Codex models at http://127.0.0.1:{port}/v1; `codex` uses {model}."
-    );
+    println!("Configured selectable Codex models at http://127.0.0.1:{port}/v1.");
     Ok(())
 }
 
@@ -487,18 +553,15 @@ async fn ensure_daemon(paths: &AppPaths, port: u16) -> Result<()> {
         return Ok(());
     }
     fs::create_dir_all(&paths.data_dir)?;
-    let log = fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(&paths.daemon_log)?;
-    let error_log = log.try_clone()?;
     Command::new(std::env::current_exe()?)
         .arg("serve")
         .arg("--port")
         .arg(port.to_string())
+        .arg("--daemon-log")
+        .arg(&paths.daemon_log)
         .stdin(Stdio::null())
-        .stdout(Stdio::from(log))
-        .stderr(Stdio::from(error_log))
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
         .spawn()
         .context("failed to start Codex OAuth daemon")?;
     for _ in 0..40 {
@@ -511,6 +574,255 @@ async fn ensure_daemon(paths: &AppPaths, port: u16) -> Result<()> {
         "daemon did not become healthy; inspect {}",
         paths.daemon_log.display()
     )
+}
+
+fn logs(
+    paths: &AppPaths,
+    follow: bool,
+    lines: usize,
+    errors: bool,
+    request_id: Option<&str>,
+) -> Result<()> {
+    for line in read_log_tail(&paths.daemon_log, lines, errors, request_id)? {
+        println!("{line}");
+    }
+    if follow {
+        follow_log(&paths.daemon_log, errors, request_id)?;
+    }
+    Ok(())
+}
+
+fn read_log_tail(
+    path: &Path,
+    lines: usize,
+    errors: bool,
+    request_id: Option<&str>,
+) -> Result<Vec<String>> {
+    let file = fs::File::open(path)
+        .with_context(|| format!("could not open proxy log {}", path.display()))?;
+    let mut tail = VecDeque::with_capacity(lines);
+    if lines == 0 {
+        return Ok(Vec::new());
+    }
+    for line in BufReader::new(file).lines() {
+        let line = line?;
+        if !log_line_matches(&line, errors, request_id) {
+            continue;
+        }
+        if tail.len() == lines {
+            tail.pop_front();
+        }
+        tail.push_back(line);
+    }
+    Ok(tail.into_iter().collect())
+}
+
+fn follow_log(path: &Path, errors: bool, request_id: Option<&str>) -> Result<()> {
+    let mut offset = fs::metadata(path)
+        .map(|metadata| metadata.len())
+        .unwrap_or(0);
+    loop {
+        if let Ok(mut file) = fs::File::open(path) {
+            let length = file.metadata()?.len();
+            if length < offset {
+                offset = 0;
+            }
+            if length > offset {
+                file.seek(SeekFrom::Start(offset))?;
+                let mut reader = BufReader::new(file);
+                let mut line = String::new();
+                while reader.read_line(&mut line)? != 0 {
+                    if log_line_matches(line.trim_end_matches(['\r', '\n']), errors, request_id) {
+                        print!("{line}");
+                    }
+                    line.clear();
+                }
+                offset = reader.stream_position()?;
+                std::io::stdout().flush()?;
+            }
+        }
+        std::thread::sleep(Duration::from_millis(250));
+    }
+}
+
+fn log_line_matches(line: &str, errors: bool, request_id: Option<&str>) -> bool {
+    if request_id.is_some_and(|request_id| !line.contains(request_id)) {
+        return false;
+    }
+    !errors || is_error_log_line(line)
+}
+
+fn is_error_log_line(line: &str) -> bool {
+    line.contains(" WARN ")
+        || line.starts_with("WARN ")
+        || line.contains(" ERROR ")
+        || line.starts_with("ERROR ")
+        || line.contains("SSE error")
+        || line.contains("request failed")
+        || line.contains("transport failed")
+        || [
+            "sse_error",
+            "http_error",
+            "transport_error",
+            "client_disconnected",
+            "upstream_request_error",
+        ]
+        .iter()
+        .any(|outcome| line.contains(&format!("outcome=\"{outcome}\"")))
+}
+
+fn rotate_log_if_needed(path: &Path, max_bytes: u64, backups: usize) -> Result<()> {
+    let Ok(metadata) = fs::metadata(path) else {
+        return Ok(());
+    };
+    if metadata.len() < max_bytes {
+        return Ok(());
+    }
+    rotate_log_files(path, backups)?;
+    Ok(())
+}
+
+fn rotate_log_files(path: &Path, backups: usize) -> std::io::Result<()> {
+    if backups == 0 {
+        fs::File::create(path)?;
+        return Ok(());
+    }
+    for index in (1..=backups).rev() {
+        let source = if index == 1 {
+            path.to_owned()
+        } else {
+            log_backup_path(path, index - 1)
+        };
+        let target = log_backup_path(path, index);
+        if target.exists() {
+            fs::remove_file(&target)?;
+        }
+        if source.exists() {
+            fs::rename(source, target)?;
+        }
+    }
+    Ok(())
+}
+
+fn log_backup_path(path: &Path, index: usize) -> PathBuf {
+    let mut path = path.as_os_str().to_owned();
+    path.push(format!(".{index}"));
+    PathBuf::from(path)
+}
+
+#[derive(Clone)]
+struct RotatingLogWriter {
+    state: Arc<StdMutex<RotatingLogState>>,
+}
+
+struct RotatingLogState {
+    path: PathBuf,
+    file: Option<fs::File>,
+    bytes_written: u64,
+    max_bytes: u64,
+    backups: usize,
+}
+
+struct RotatingEventWriter {
+    state: Arc<StdMutex<RotatingLogState>>,
+    buffer: Vec<u8>,
+}
+
+impl RotatingLogWriter {
+    fn new(path: PathBuf, max_bytes: u64, backups: usize) -> Result<Self> {
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        rotate_log_if_needed(&path, max_bytes, backups)?;
+        let file = fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&path)?;
+        let bytes_written = file.metadata()?.len();
+        Ok(Self {
+            state: Arc::new(StdMutex::new(RotatingLogState {
+                path,
+                file: Some(file),
+                bytes_written,
+                max_bytes,
+                backups,
+            })),
+        })
+    }
+}
+
+impl<'writer> MakeWriter<'writer> for RotatingLogWriter {
+    type Writer = RotatingEventWriter;
+
+    fn make_writer(&'writer self) -> Self::Writer {
+        RotatingEventWriter {
+            state: self.state.clone(),
+            buffer: Vec::new(),
+        }
+    }
+}
+
+impl RotatingEventWriter {
+    fn commit(&mut self) -> std::io::Result<()> {
+        if self.buffer.is_empty() {
+            return Ok(());
+        }
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|_| std::io::Error::other("rotating log lock poisoned"))?;
+        state.write_event(&self.buffer)?;
+        self.buffer.clear();
+        Ok(())
+    }
+}
+
+impl Write for RotatingEventWriter {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        self.buffer.extend_from_slice(bytes);
+        Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.commit()
+    }
+}
+
+impl Drop for RotatingEventWriter {
+    fn drop(&mut self) {
+        let _ = self.commit();
+    }
+}
+
+impl RotatingLogState {
+    fn write_event(&mut self, event: &[u8]) -> std::io::Result<()> {
+        let event_bytes = u64::try_from(event.len()).unwrap_or(u64::MAX);
+        if self.bytes_written > 0 && self.bytes_written.saturating_add(event_bytes) > self.max_bytes
+        {
+            self.rotate()?;
+        }
+        let file = self
+            .file
+            .as_mut()
+            .ok_or_else(|| std::io::Error::other("rotating log file is not open"))?;
+        file.write_all(event)?;
+        file.flush()?;
+        self.bytes_written = self.bytes_written.saturating_add(event_bytes);
+        Ok(())
+    }
+
+    fn rotate(&mut self) -> std::io::Result<()> {
+        self.file.take();
+        rotate_log_files(&self.path, self.backups)?;
+        self.file = Some(
+            fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(&self.path)?,
+        );
+        self.bytes_written = 0;
+        Ok(())
+    }
 }
 
 async fn status(paths: &AppPaths, port: u16, json_output: bool) -> Result<()> {
@@ -658,6 +970,110 @@ mod tests {
                 command: ModelsCommand::Sync
             }
         ));
+    }
+
+    #[test]
+    fn logs_command_supports_follow_lines_errors_and_request_id() {
+        let cli = Cli::try_parse_from([
+            "grok-codex-oauth",
+            "logs",
+            "--follow",
+            "--lines",
+            "25",
+            "--errors",
+            "--request-id",
+            "request-42",
+        ])
+        .expect("parse logs");
+
+        assert!(matches!(
+            cli.command,
+            Commands::Logs {
+                follow: true,
+                lines: 25,
+                errors: true,
+                request_id: Some(ref request_id),
+            } if request_id == "request-42"
+        ));
+    }
+
+    #[test]
+    fn log_tail_applies_error_and_request_id_filters_before_limiting_lines() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let path = directory.path().join("daemon.log");
+        fs::write(
+            &path,
+            concat!(
+                "INFO request completed client_request_id=\"request-1\" outcome=\"completed\"\n",
+                "WARN SSE error client_request_id=\"request-2\" outcome=\"sse_error\"\n",
+                "WARN SSE error client_request_id=\"request-1\" outcome=\"server_error\"\n",
+                "INFO request completed client_request_id=\"request-1\" outcome=\"completed\"\n",
+            ),
+        )
+        .expect("write log");
+
+        let lines =
+            read_log_tail(&path, 1, true, Some("request-1")).expect("read filtered log tail");
+
+        assert_eq!(
+            lines,
+            vec!["WARN SSE error client_request_id=\"request-1\" outcome=\"server_error\""]
+        );
+    }
+
+    #[test]
+    fn log_rotation_keeps_three_backups_and_discards_the_oldest() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let path = directory.path().join("daemon.log");
+
+        for contents in ["first-log", "second-log", "third-log", "fourth-log"] {
+            fs::write(&path, contents).expect("write active log");
+            rotate_log_if_needed(&path, 1, 3).expect("rotate log");
+        }
+
+        assert!(!path.exists());
+        assert_eq!(
+            fs::read_to_string(path.with_extension("log.1")).expect("backup 1"),
+            "fourth-log"
+        );
+        assert_eq!(
+            fs::read_to_string(path.with_extension("log.2")).expect("backup 2"),
+            "third-log"
+        );
+        assert_eq!(
+            fs::read_to_string(path.with_extension("log.3")).expect("backup 3"),
+            "second-log"
+        );
+        assert!(!path.with_extension("log.4").exists());
+    }
+
+    #[test]
+    fn rotating_writer_enforces_the_size_limit_while_the_daemon_is_running() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let path = directory.path().join("daemon.log");
+        let writer = RotatingLogWriter::new(path.clone(), 10, 3).expect("rotating writer");
+
+        for contents in ["first-log", "second-log", "third-log", "fourth-log"] {
+            let mut event = writer.make_writer();
+            writeln!(event, "{contents}").expect("write event");
+        }
+
+        assert_eq!(
+            fs::read_to_string(&path).expect("active log"),
+            "fourth-log\n"
+        );
+        assert_eq!(
+            fs::read_to_string(path.with_extension("log.1")).expect("backup 1"),
+            "third-log\n"
+        );
+        assert_eq!(
+            fs::read_to_string(path.with_extension("log.2")).expect("backup 2"),
+            "second-log\n"
+        );
+        assert_eq!(
+            fs::read_to_string(path.with_extension("log.3")).expect("backup 3"),
+            "first-log\n"
+        );
     }
 
     #[test]

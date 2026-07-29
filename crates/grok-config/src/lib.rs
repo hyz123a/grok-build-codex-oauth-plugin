@@ -12,6 +12,7 @@ use toml_edit::{Array, DocumentMut, InlineTable, Item, Table, Value, value};
 
 const GROK_REASONING_EFFORTS: &[&str] =
     &["none", "minimal", "low", "medium", "high", "xhigh", "max"];
+const DEFAULT_CONTEXT_WINDOW: i64 = 272_000;
 
 pub const MANAGED_MODEL_ALIASES: &[&str] = &[
     "codex",
@@ -54,7 +55,7 @@ impl ModelConfig {
             model: model.into(),
             port,
             local_secret: local_secret.into(),
-            context_window: 400_000,
+            context_window: DEFAULT_CONTEXT_WINDOW,
         }
     }
 }
@@ -65,21 +66,36 @@ pub fn read_model_config(path: &Path) -> Result<Option<ModelConfig>, ConfigError
         return Ok(None);
     }
     let document = parse(&original)?;
-    let Some(codex) = document
-        .get("model")
-        .and_then(Item::as_table)
-        .and_then(|models| models.get("codex"))
-        .and_then(Item::as_table)
-    else {
+    let Some(models) = document.get("model").and_then(Item::as_table) else {
         return Ok(None);
     };
-    let model = required_string(codex, "model")?;
-    let base_url = required_string(codex, "base_url")?;
-    let local_secret = required_string(codex, "api_key")?;
-    let context_window = codex
+    let managed = MANAGED_MODEL_ALIASES
+        .iter()
+        .filter(|alias| **alias != "codex")
+        .find_map(|alias| models.get(alias).and_then(Item::as_table))
+        .or_else(|| {
+            models.iter().find_map(|(alias, item)| {
+                let table = item.as_table()?;
+                (alias.starts_with("codex-") && is_managed_model_table(table)).then_some(table)
+            })
+        });
+    let (managed, legacy) = match managed {
+        Some(managed) => (managed, false),
+        None => match models.get("codex").and_then(Item::as_table) {
+            Some(managed) => (managed, true),
+            None => return Ok(None),
+        },
+    };
+    let model = required_string(managed, "model")?;
+    let base_url = required_string(managed, "base_url")?;
+    let local_secret = required_string(managed, "api_key")?;
+    let mut context_window = managed
         .get("context_window")
         .and_then(Item::as_integer)
-        .unwrap_or(400_000);
+        .unwrap_or(DEFAULT_CONTEXT_WINDOW);
+    if legacy && context_window == 400_000 {
+        context_window = DEFAULT_CONTEXT_WINDOW;
+    }
     let port = base_url
         .strip_prefix("http://127.0.0.1:")
         .and_then(|remainder| remainder.split('/').next())
@@ -143,21 +159,11 @@ pub fn replace_model_catalog(
     let models = document["model"]
         .as_table_mut()
         .ok_or(ConfigError::ConflictingValue("model"))?;
+    models.remove("codex");
     for alias in previously_managed {
-        if alias != "codex" {
-            models.remove(alias);
-        }
+        models.remove(alias);
     }
-    let default_model = SelectableModel {
-        alias: "codex".into(),
-        model: config.model.clone(),
-        display_name: "Codex via ChatGPT OAuth".into(),
-        context_window: None,
-        default_reasoning_effort: None,
-        supported_reasoning_efforts: Vec::new(),
-    };
-    upsert_model_table(models, &default_model, config)?;
-    let mut installed = vec!["codex".to_string()];
+    let mut installed = Vec::new();
     for selectable in catalog {
         if selectable.alias == "codex" || installed.contains(&selectable.alias) {
             continue;
@@ -167,6 +173,18 @@ pub fn replace_model_catalog(
     }
     persist_if_changed(path, &original, &document.to_string())?;
     Ok(installed)
+}
+
+fn is_managed_model_table(table: &Table) -> bool {
+    table
+        .get("name")
+        .and_then(Item::as_str)
+        .is_some_and(|name| name.starts_with("Codex "))
+        && table.get("api_backend").and_then(Item::as_str) == Some("responses")
+        && table
+            .get("base_url")
+            .and_then(Item::as_str)
+            .is_some_and(|url| url.starts_with("http://127.0.0.1:"))
 }
 
 pub fn uninstall_model(path: &Path) -> Result<(), ConfigError> {

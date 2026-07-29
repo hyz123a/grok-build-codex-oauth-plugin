@@ -15,6 +15,7 @@ stable API. For production or multi-user systems, use the OpenAI Platform API in
 - Fixed-upstream loopback proxy at `127.0.0.1:1456`
 - Local random proxy credential, request-size limit, and concurrency limit
 - Responses JSON adaptation and streaming SSE bridging for Grok terminal-output compatibility
+- Filtering of backend-only JSON `keepalive` events that Grok's Responses decoder cannot accept
 - Expiry-window refresh plus one refresh/retry after an upstream `401`
 - Account-aware Codex model discovery with private local cache and built-in offline fallback
 - Idempotent, scoped edits to managed `[model.codex*]` entries with a config backup
@@ -66,6 +67,7 @@ uninstall-config       Remove only managed [model.codex*] entries
 serve                  Run the foreground loopback proxy
 ensure-daemon          Start the proxy if needed
 doctor                 Check the local installation
+logs                   Show or follow proxy diagnostic logs
 ```
 
 `setup` creates `~/.grok/config.toml.bak` before changing an existing configuration. OAuth tokens
@@ -80,6 +82,25 @@ last cache; on a first-run offline machine it uses the built-in catalog.
 The sync also installs each model's reasoning-effort menu and default. Grok 0.2.114 supports
 `low`, `medium`, `high`, `xhigh`, and `max`; a backend-only `ultra` level is omitted until Grok can
 represent it.
+
+## Proxy diagnostics
+
+The daemon writes timestamped request metadata to `~/.grok/codex-oauth/daemon.log`. Each valid
+proxy request records the model and client request ID, upstream status and request ID,
+response-header latency, first-SSE-byte latency, SSE error type, and final outcome and duration.
+Stream error messages, prompts, OAuth tokens, and response content are not included.
+If Grok omits `x-request-id`, the proxy generates a `proxy-<pid>-<sequence>` correlation ID.
+
+```bash
+grok-codex-oauth logs
+grok-codex-oauth logs --follow
+grok-codex-oauth logs --lines 500 --errors
+grok-codex-oauth logs --request-id <request-id>
+```
+
+The final `outcome` distinguishes `completed`, `sse_error`, `http_error`,
+`transport_error`, and `client_disconnected`. The daemon rotates the active log at 10 MiB and
+keeps `daemon.log.1` through `daemon.log.3`.
 
 ## Test architecture
 

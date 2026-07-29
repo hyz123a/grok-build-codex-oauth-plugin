@@ -21,6 +21,7 @@ pub const DEFAULT_ORIGINATOR: &str = "grok-build";
 pub struct CodexSseTransformer {
     buffer: Vec<u8>,
     output_items: BTreeMap<u64, Value>,
+    filtered_keepalive_events: u64,
 }
 
 impl CodexSseTransformer {
@@ -32,7 +33,9 @@ impl CodexSseTransformer {
                 .buffer
                 .drain(..position + delimiter_length)
                 .collect::<Vec<_>>();
-            events.push(self.transform_event(event));
+            if let Some(event) = self.transform_event(event) {
+                events.push(event);
+            }
         }
         events
     }
@@ -41,29 +44,38 @@ impl CodexSseTransformer {
         if self.buffer.is_empty() {
             Vec::new()
         } else {
-            vec![std::mem::take(&mut self.buffer)]
+            let remainder = std::mem::take(&mut self.buffer);
+            self.transform_event(remainder).into_iter().collect()
         }
     }
 
-    fn transform_event(&mut self, original: Vec<u8>) -> Vec<u8> {
+    pub fn take_filtered_keepalive_events(&mut self) -> u64 {
+        std::mem::take(&mut self.filtered_keepalive_events)
+    }
+
+    fn transform_event(&mut self, original: Vec<u8>) -> Option<Vec<u8>> {
         let Ok(text) = std::str::from_utf8(&original) else {
-            return original;
+            return Some(original);
         };
         let Some(data) = text.lines().find_map(|line| {
             line.strip_prefix("data:")
                 .map(str::trim_start)
                 .filter(|data| !data.is_empty() && *data != "[DONE]")
         }) else {
-            return original;
+            return Some(original);
         };
         let Ok(mut event) = serde_json::from_str::<Value>(data) else {
-            return original;
+            return Some(original);
         };
+        if event.get("type").and_then(Value::as_str) == Some("keepalive") {
+            self.filtered_keepalive_events = self.filtered_keepalive_events.saturating_add(1);
+            return None;
+        }
         let changed = self.observe_event(&mut event);
         if changed {
-            format!("data: {event}\n\n").into_bytes()
+            Some(format!("data: {event}\n\n").into_bytes())
         } else {
-            original
+            Some(original)
         }
     }
 
@@ -290,6 +302,7 @@ pub fn transform_responses_request(
     object.insert("stream".into(), Value::Bool(true));
     object.remove("max_output_tokens");
     object.remove("max_completion_tokens");
+    object.remove("temperature");
     move_instruction_messages(object)?;
 
     match object.get_mut("include") {

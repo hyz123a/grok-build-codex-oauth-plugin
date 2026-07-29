@@ -54,6 +54,8 @@ fn catalog_installs_selectable_codex_model_aliases() {
     install_model_catalog(&path, &managed).expect("install catalog");
     let result = std::fs::read_to_string(&path).expect("read");
 
+    assert!(!result.contains("[model.codex]"));
+    assert!(result.contains("context_window = 272000"));
     for (alias, model) in [
         ("codex-sol", "gpt-5.6-sol"),
         ("codex-terra", "gpt-5.6-terra"),
@@ -89,7 +91,7 @@ fn dynamic_catalog_replaces_stale_managed_aliases_and_preserves_user_models() {
     let path = directory.path().join("config.toml");
     std::fs::write(
         &path,
-        "[model.codex-old]\nmodel = \"old\"\n\n[model.codex-user]\nmodel = \"mine\"\n",
+        "[model.codex]\nmodel = \"gpt-5.4\"\n\n[model.codex-old]\nmodel = \"old\"\n\n[model.codex-user]\nmodel = \"mine\"\n",
     )
     .expect("seed config");
     let config = ModelConfig::new("gpt-5.4", 1456, "local-secret");
@@ -117,6 +119,7 @@ fn dynamic_catalog_replaces_stale_managed_aliases_and_preserves_user_models() {
     .expect("replace catalog");
 
     let result = std::fs::read_to_string(path).expect("read config");
+    assert!(!result.contains("[model.codex]"));
     assert!(!result.contains("[model.codex-old]"));
     assert!(result.contains("[model.codex-user]"));
     assert!(result.contains("[model.codex-gpt-5-7]"));
@@ -127,9 +130,59 @@ fn dynamic_catalog_replaces_stale_managed_aliases_and_preserves_user_models() {
     assert!(result.contains("value = \"xhigh\""));
     assert!(result.contains("value = \"max\""));
     assert!(!result.contains("value = \"ultra\""));
+    assert_eq!(installed, vec!["codex-gpt-5-7".to_string()]);
+}
+
+#[test]
+fn managed_config_can_be_read_from_a_specific_model_alias() {
+    let directory = tempfile::tempdir().expect("tempdir");
+    let path = directory.path().join("config.toml");
+    std::fs::write(
+        &path,
+        "[model.codex-sol]\nmodel = \"gpt-5.6-sol\"\nbase_url = \"http://127.0.0.1:1555/v1\"\nname = \"Codex GPT-5.6 Sol\"\napi_backend = \"responses\"\napi_key = \"specific-secret\"\ncontext_window = 272000\n",
+    )
+    .expect("seed config");
+
     assert_eq!(
-        installed,
-        vec!["codex".to_string(), "codex-gpt-5-7".to_string()]
+        read_model_config(&path).expect("read"),
+        Some(ModelConfig {
+            model: "gpt-5.6-sol".into(),
+            port: 1555,
+            local_secret: "specific-secret".into(),
+            context_window: 272_000,
+        })
+    );
+}
+
+#[test]
+fn new_model_config_uses_the_codex_context_window_default() {
+    assert_eq!(
+        ModelConfig::new("gpt-5.6-sol", 1456, "secret").context_window,
+        272_000
+    );
+}
+
+#[test]
+fn legacy_generic_context_window_is_normalized_during_migration() {
+    let directory = tempfile::tempdir().expect("tempdir");
+    let path = directory.path().join("config.toml");
+    install_model(
+        &path,
+        &ModelConfig {
+            model: "gpt-5.4".into(),
+            port: 1456,
+            local_secret: "legacy-secret".into(),
+            context_window: 400_000,
+        },
+    )
+    .expect("install legacy model");
+
+    assert_eq!(
+        read_model_config(&path)
+            .expect("read")
+            .expect("managed config")
+            .context_window,
+        272_000
     );
 }
 

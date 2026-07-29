@@ -1,6 +1,6 @@
 ---
 name: setup
-description: Configure the Grok `codex` model for the local OAuth proxy.
+description: Configure selectable Grok `codex-*` models for the local OAuth proxy.
 ---
 
 Run `grok-codex-oauth setup` with the shell tool.

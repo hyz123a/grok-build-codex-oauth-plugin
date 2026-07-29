@@ -1,7 +1,8 @@
 use std::sync::{
-    Arc,
+    Arc, Mutex as StdMutex,
     atomic::{AtomicUsize, Ordering},
 };
+use std::{io, io::Write};
 
 use async_trait::async_trait;
 use axum::{
@@ -17,6 +18,7 @@ use codex_proxy::{CredentialProvider, ProxyConfig, build_router};
 use http_body_util::BodyExt;
 use serde_json::{Value, json};
 use tokio::sync::Mutex;
+use tracing_subscriber::fmt::MakeWriter;
 
 #[derive(Clone)]
 struct StubCredentials {
@@ -119,6 +121,12 @@ async fn proxy_requires_local_secret_and_forwards_transformed_sse() {
     assert_eq!(captures.len(), 1);
     assert_eq!(captures[0].0["authorization"], "Bearer oauth-secret");
     assert_eq!(captures[0].0["chatgpt-account-id"], "account-1");
+    assert!(
+        captures[0].0["x-request-id"]
+            .to_str()
+            .expect("request ID")
+            .starts_with("proxy-")
+    );
     assert_eq!(captures[0].1["store"], false);
     assert_eq!(captures[0].1["stream"], true);
     assert_eq!(
@@ -180,4 +188,123 @@ async fn upstream_401_refreshes_and_retries_only_once() {
     assert_eq!(response.status(), StatusCode::OK);
     assert_eq!(attempts.load(Ordering::SeqCst), 2);
     assert_eq!(refreshes.load(Ordering::SeqCst), 1);
+}
+
+#[derive(Clone, Default)]
+struct LogCapture(Arc<StdMutex<Vec<u8>>>);
+
+struct LogWriter(LogCapture);
+
+impl Write for LogWriter {
+    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+        self.0
+            .0
+            .lock()
+            .expect("log capture lock")
+            .extend_from_slice(bytes);
+        Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+}
+
+impl<'writer> MakeWriter<'writer> for LogCapture {
+    type Writer = LogWriter;
+
+    fn make_writer(&'writer self) -> Self::Writer {
+        LogWriter(self.clone())
+    }
+}
+
+impl LogCapture {
+    fn contents(&self) -> String {
+        String::from_utf8(self.0.lock().expect("log capture lock").clone())
+            .expect("UTF-8 tracing output")
+    }
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn logs_request_timing_upstream_id_sse_error_and_completion_without_error_message() {
+    async fn erroring_upstream() -> Response {
+        Response::builder()
+            .status(StatusCode::OK)
+            .header("content-type", "text/event-stream")
+            .header("x-request-id", "upstream-request-42")
+            .body(Body::from(concat!(
+                "data: {\"type\":\"response.created\"}\n\n",
+                "data: {\"type\":\"keepalive\"}\n\n",
+                "data: {\"type\":\"error\",\"error\":{",
+                "\"type\":\"service_unavailable_error\",",
+                "\"message\":\"diagnostic-body-must-not-be-logged\"}}\n\n"
+            )))
+            .expect("response")
+    }
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind");
+    let address = listener.local_addr().expect("addr");
+    tokio::spawn(async move {
+        axum::serve(
+            listener,
+            Router::new().route("/responses", post(erroring_upstream)),
+        )
+        .await
+        .expect("server");
+    });
+
+    let app = build_router(
+        ProxyConfig::for_test(format!("http://{address}/responses"), "local-secret"),
+        Arc::new(StubCredentials {
+            refreshes: Arc::new(AtomicUsize::new(0)),
+        }),
+    )
+    .expect("router");
+    let logs = LogCapture::default();
+    let subscriber = tracing_subscriber::fmt()
+        .with_ansi(false)
+        .without_time()
+        .with_writer(logs.clone())
+        .finish();
+    tracing::subscriber::set_global_default(subscriber).expect("install tracing capture");
+
+    let response = tower::ServiceExt::oneshot(
+        app,
+        axum::http::Request::post("/v1/responses")
+            .header("authorization", "Bearer local-secret")
+            .header("content-type", "application/json")
+            .header("x-request-id", "client-request-7")
+            .body(Body::from(r#"{"model":"gpt-5.6-sol","input":[]}"#))
+            .expect("request"),
+    )
+    .await
+    .expect("response");
+    let body = response
+        .into_body()
+        .collect()
+        .await
+        .expect("stream body")
+        .to_bytes();
+    assert!(
+        !body
+            .windows(b"keepalive".len())
+            .any(|part| part == b"keepalive")
+    );
+
+    let logs = logs.contents();
+    assert!(logs.contains("Codex upstream response headers received"));
+    assert!(logs.contains("client_request_id=\"client-request-7\""));
+    assert!(logs.contains("upstream_request_id=\"upstream-request-42\""));
+    assert!(logs.contains("response_headers_ms="));
+    assert!(logs.contains("Codex upstream first SSE bytes received"));
+    assert!(logs.contains("ttfb_ms="));
+    assert!(logs.contains("Codex upstream SSE error received"));
+    assert!(logs.contains("sse_error_type=\"service_unavailable_error\""));
+    assert!(logs.contains("Codex proxy request completed"));
+    assert!(logs.contains("total_ms="));
+    assert!(logs.contains("outcome=\"sse_error\""));
+    assert!(logs.contains("filtered_keepalive_events=1"));
+    assert!(!logs.contains("diagnostic-body-must-not-be-logged"));
 }

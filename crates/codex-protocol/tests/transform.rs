@@ -13,6 +13,7 @@ fn transform_enforces_stateless_streaming_without_losing_grok_fields() {
         "include": ["file_search_call.results"],
         "max_output_tokens": 4096,
         "max_completion_tokens": 2048,
+        "temperature": 0.3,
         "input": [{"type": "message", "role": "user", "content": "hello"}],
         "tools": [{"type": "function", "name": "read_file"}],
         "tool_choice": "auto",
@@ -32,6 +33,7 @@ fn transform_enforces_stateless_streaming_without_losing_grok_fields() {
     assert_eq!(transformed["reasoning"]["effort"], "high");
     assert!(transformed.get("max_output_tokens").is_none());
     assert!(transformed.get("max_completion_tokens").is_none());
+    assert!(transformed.get("temperature").is_none());
     assert_eq!(transformed["input"][0]["content"], "hello");
     assert_eq!(transformed["tools"][0]["name"], "read_file");
     assert_eq!(transformed["tool_choice"], "auto");
@@ -166,4 +168,30 @@ data: {"type":"response.completed","response":{"id":"resp-1","status":"completed
     assert!(output.contains(r#""call_id":"call-1""#));
     assert!(output.contains(r#""name":"read_file""#));
     assert!(output.contains(r#""arguments":"{\"path\":\"Cargo.toml\"}""#));
+}
+
+#[test]
+fn sse_bridge_drops_json_keepalive_without_dropping_adjacent_response_events() {
+    let mut bridge = CodexSseTransformer::default();
+    let stream = br#"data: {"type":"response.created","response":{"id":"resp-1"}}
+
+data: {"type":"keepalive"}
+
+data: {"type":"response.future_event","value":"preserve-me"}
+
+data: {"type":"response.in_progress","response":{"id":"resp-1"}}
+
+"#;
+
+    let mut output = bridge.push(&stream[..61]);
+    output.extend(bridge.push(&stream[61..]));
+    output.extend(bridge.finish());
+    let output = String::from_utf8(output.concat()).expect("utf8 SSE");
+
+    assert!(output.contains(r#""type":"response.created""#));
+    assert!(output.contains(r#""type":"response.in_progress""#));
+    assert!(output.contains(r#""type":"response.future_event""#));
+    assert!(!output.contains(r#""type":"keepalive""#));
+    assert_eq!(bridge.take_filtered_keepalive_events(), 1);
+    assert_eq!(bridge.take_filtered_keepalive_events(), 0);
 }
