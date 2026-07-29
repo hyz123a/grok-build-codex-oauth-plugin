@@ -1,0 +1,9 @@
+{
+  "name": "codex-oauth",
+  "description": "Use Codex through a personal ChatGPT subscription with a loopback OAuth companion.",
+  "version": "0.1.0",
+  "license": "MIT",
+  "keywords": ["codex", "oauth", "chatgpt", "responses"],
+  "skills": ["skills/"],
+  "hooks": "hooks/hooks.json"
+}

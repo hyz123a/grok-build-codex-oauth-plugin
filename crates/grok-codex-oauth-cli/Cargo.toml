@@ -1,0 +1,30 @@
+[package]
+name = "grok-codex-oauth"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "grok-codex-oauth"
+path = "src/main.rs"
+
+[dependencies]
+anyhow.workspace = true
+axum.workspace = true
+base64.workspace = true
+clap.workspace = true
+codex-oauth = { path = "../codex-oauth" }
+codex-models = { path = "../codex-models" }
+codex-proxy = { path = "../codex-proxy" }
+directories.workspace = true
+grok-config = { path = "../grok-config" }
+rand.workspace = true
+reqwest.workspace = true
+serde_json.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+webbrowser.workspace = true
+
+[lints]
+workspace = true
