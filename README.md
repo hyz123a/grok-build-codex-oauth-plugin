@@ -17,6 +17,7 @@ stable API. For production or multi-user systems, use the OpenAI Platform API in
 - Responses JSON adaptation and streaming SSE bridging for Grok terminal-output compatibility
 - Filtering of backend-only JSON `keepalive` events that Grok's Responses decoder cannot accept
 - Expiry-window refresh plus one refresh/retry after an upstream `401`
+- Usage-limit error normalization, per-session prompt caching, and model-aware reasoning clamps
 - Account-aware Codex model discovery with private local cache and built-in offline fallback
 - Idempotent, scoped edits to managed `[model.codex*]` entries with a config backup
 - Grok skills and a `SessionStart` daemon hook
@@ -90,6 +91,11 @@ proxy request records the model and client request ID, upstream status and reque
 response-header latency, first-SSE-byte latency, SSE error type, and final outcome and duration.
 Stream error messages, prompts, OAuth tokens, and response content are not included.
 If Grok omits `x-request-id`, the proxy generates a `proxy-<pid>-<sequence>` correlation ID.
+Cache diagnostics record only whether `prompt_cache_key` is present, a short SHA-256 fingerprint,
+input and cached-input token counts, and the cache-hit percentage; the raw cache key is never logged.
+When Grok omits `prompt_cache_key`, the proxy derives it from Grok's stable `x-grok-session-id`
+and sends the same value through the native Codex `session-id` and `thread-id` headers. An explicit
+request-body cache key always takes precedence.
 
 ```bash
 grok-codex-oauth logs

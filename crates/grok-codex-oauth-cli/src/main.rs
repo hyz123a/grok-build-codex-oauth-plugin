@@ -508,7 +508,26 @@ async fn serve(paths: &AppPaths, port: u16) -> Result<()> {
         Arc::new(paths.store()),
         OAuthClient::new(OAuthConfig::default()),
     ));
-    let app = build_router(ProxyConfig::production(secret)?, credentials)?;
+    let mut proxy_config = ProxyConfig::production(secret)?;
+    match load_cached_catalog(&paths.models_cache) {
+        Ok(Some(models)) => {
+            for model in models {
+                proxy_config = proxy_config.with_model_reasoning(
+                    model.slug,
+                    model.supported_reasoning_efforts,
+                    model.default_reasoning_effort,
+                );
+            }
+        }
+        Ok(None) => {}
+        Err(error) => {
+            tracing::warn!(
+                error = %error,
+                "Could not load model reasoning metadata; using compatibility defaults"
+            );
+        }
+    }
+    let app = build_router(proxy_config, credentials)?;
     let address = SocketAddr::from(([127, 0, 0, 1], port));
     let listener = tokio::net::TcpListener::bind(address)
         .await

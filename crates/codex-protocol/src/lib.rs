@@ -408,6 +408,7 @@ pub fn build_upstream_headers(
     incoming: &HeaderMap,
     access_token: &str,
     account_id: &str,
+    prompt_cache_key: Option<&str>,
 ) -> Result<HeaderMap, ProtocolError> {
     let mut headers = HeaderMap::new();
 
@@ -435,5 +436,11 @@ pub fn build_upstream_headers(
     headers.insert("originator", HeaderValue::from_static(DEFAULT_ORIGINATOR));
     headers.insert(ACCEPT, HeaderValue::from_static("text/event-stream"));
     headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
+    if let Some(prompt_cache_key) = prompt_cache_key.filter(|key| !key.is_empty()) {
+        let session = HeaderValue::from_str(prompt_cache_key)
+            .map_err(|_| ProtocolError::InvalidHeader("prompt_cache_key"))?;
+        headers.insert("session-id", session.clone());
+        headers.insert("thread-id", session);
+    }
     Ok(headers)
 }

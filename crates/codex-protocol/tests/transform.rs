@@ -113,14 +113,18 @@ fn upstream_headers_replace_local_authorization_and_sensitive_headers() {
     incoming.insert("cookie", HeaderValue::from_static("private=value"));
     incoming.insert("x-request-id", HeaderValue::from_static("request-1"));
 
-    let headers =
-        build_upstream_headers(&incoming, "oauth-token", "account-1").expect("valid headers");
+    let headers = build_upstream_headers(&incoming, "oauth-token", "account-1", Some("session-42"))
+        .expect("valid headers");
 
     assert_eq!(headers[AUTHORIZATION], "Bearer oauth-token");
     assert_eq!(headers["chatgpt-account-id"], "account-1");
     assert_eq!(headers["originator"], "grok-build");
     assert_eq!(headers["accept"], "text/event-stream");
     assert_eq!(headers["x-request-id"], "request-1");
+    assert_eq!(headers["session-id"], "session-42");
+    assert_eq!(headers["thread-id"], "session-42");
+    assert!(!headers.contains_key("conversation_id"));
+    assert!(!headers.contains_key("session_id"));
     assert!(!headers.contains_key("cookie"));
 }
 

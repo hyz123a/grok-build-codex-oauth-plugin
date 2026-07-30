@@ -103,6 +103,7 @@ async fn proxy_requires_local_secret_and_forwards_transformed_sse() {
         axum::http::Request::post("/v1/responses")
             .header("authorization", "Bearer local-secret")
             .header("content-type", "application/json")
+            .header("x-grok-session-id", "grok-session-42")
             .body(Body::from(r#"{"store":true,"stream":false,"input":[]}"#))
             .expect("request"),
     )
@@ -121,6 +122,9 @@ async fn proxy_requires_local_secret_and_forwards_transformed_sse() {
     assert_eq!(captures.len(), 1);
     assert_eq!(captures[0].0["authorization"], "Bearer oauth-secret");
     assert_eq!(captures[0].0["chatgpt-account-id"], "account-1");
+    assert_eq!(captures[0].0["session-id"], "grok-session-42");
+    assert_eq!(captures[0].0["thread-id"], "grok-session-42");
+    assert_eq!(captures[0].1["prompt_cache_key"], "grok-session-42");
     assert!(
         captures[0].0["x-request-id"]
             .to_str()
@@ -133,6 +137,132 @@ async fn proxy_requires_local_secret_and_forwards_transformed_sse() {
         captures[0].1["include"],
         json!(["reasoning.encrypted_content"])
     );
+}
+
+#[tokio::test]
+async fn explicit_prompt_cache_key_takes_precedence_over_grok_session_id() {
+    let captures = Captures::default();
+    let upstream_url = spawn_upstream(captures.clone()).await;
+    let app = build_router(
+        ProxyConfig::for_test(upstream_url, "local-secret"),
+        Arc::new(StubCredentials {
+            refreshes: Arc::new(AtomicUsize::new(0)),
+        }),
+    )
+    .expect("router");
+
+    let response = tower::ServiceExt::oneshot(
+        app,
+        axum::http::Request::post("/v1/responses")
+            .header("authorization", "Bearer local-secret")
+            .header("content-type", "application/json")
+            .header("x-grok-session-id", "grok-session-ignored")
+            .body(Body::from(
+                r#"{"prompt_cache_key":"explicit-cache-key","input":[]}"#,
+            ))
+            .expect("request"),
+    )
+    .await
+    .expect("response");
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let captures = captures.0.lock().await;
+    assert_eq!(captures[0].0["session-id"], "explicit-cache-key");
+    assert_eq!(captures[0].0["thread-id"], "explicit-cache-key");
+    assert_eq!(captures[0].1["prompt_cache_key"], "explicit-cache-key");
+}
+
+#[tokio::test]
+async fn usage_limit_404_is_mapped_to_429_and_preserves_retry_after() {
+    async fn usage_limited_upstream() -> Response {
+        Response::builder()
+            .status(StatusCode::NOT_FOUND)
+            .header("content-type", "application/json")
+            .header("retry-after", "17")
+            .body(Body::from(
+                r#"{"error":{"type":"usage_limit_reached","message":"limit reached"}}"#,
+            ))
+            .expect("response")
+    }
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind");
+    let address = listener.local_addr().expect("addr");
+    tokio::spawn(async move {
+        axum::serve(
+            listener,
+            Router::new().route("/responses", post(usage_limited_upstream)),
+        )
+        .await
+        .expect("server");
+    });
+
+    let app = build_router(
+        ProxyConfig::for_test(format!("http://{address}/responses"), "local-secret"),
+        Arc::new(StubCredentials {
+            refreshes: Arc::new(AtomicUsize::new(0)),
+        }),
+    )
+    .expect("router");
+    let response = tower::ServiceExt::oneshot(
+        app,
+        axum::http::Request::post("/v1/responses")
+            .header("authorization", "Bearer local-secret")
+            .header("content-type", "application/json")
+            .body(Body::from("{}"))
+            .expect("request"),
+    )
+    .await
+    .expect("response");
+
+    assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+    assert_eq!(response.headers()["retry-after"], "17");
+    let body = response
+        .into_body()
+        .collect()
+        .await
+        .expect("body")
+        .to_bytes();
+    assert!(
+        body.windows("usage_limit_reached".len())
+            .any(|part| part == b"usage_limit_reached")
+    );
+}
+
+#[tokio::test]
+async fn proxy_clamps_reasoning_effort_using_the_selected_models_catalog_entry() {
+    let captures = Captures::default();
+    let upstream_url = spawn_upstream(captures.clone()).await;
+    let config = ProxyConfig::for_test(upstream_url, "local-secret").with_model_reasoning(
+        "gpt-5.5",
+        vec!["low".into(), "medium".into(), "high".into(), "xhigh".into()],
+        Some("medium".into()),
+    );
+    let app = build_router(
+        config,
+        Arc::new(StubCredentials {
+            refreshes: Arc::new(AtomicUsize::new(0)),
+        }),
+    )
+    .expect("router");
+
+    let response = tower::ServiceExt::oneshot(
+        app,
+        axum::http::Request::post("/v1/responses")
+            .header("authorization", "Bearer local-secret")
+            .header("content-type", "application/json")
+            .body(Body::from(
+                r#"{"model":"gpt-5.5","reasoning":{"effort":"max"},"input":[]}"#,
+            ))
+            .expect("request"),
+    )
+    .await
+    .expect("response");
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let captures = captures.0.lock().await;
+    assert_eq!(captures[0].1["reasoning"]["effort"], "medium");
 }
 
 #[tokio::test]
@@ -237,7 +367,10 @@ async fn logs_request_timing_upstream_id_sse_error_and_completion_without_error_
                 "data: {\"type\":\"keepalive\"}\n\n",
                 "data: {\"type\":\"error\",\"error\":{",
                 "\"type\":\"service_unavailable_error\",",
-                "\"message\":\"diagnostic-body-must-not-be-logged\"}}\n\n"
+                "\"message\":\"diagnostic-body-must-not-be-logged\"}}\n\n",
+                "data: {\"type\":\"response.completed\",\"response\":{",
+                "\"usage\":{\"input_tokens\":1000,",
+                "\"input_tokens_details\":{\"cached_tokens\":750}}}}\n\n"
             )))
             .expect("response")
     }
@@ -276,7 +409,9 @@ async fn logs_request_timing_upstream_id_sse_error_and_completion_without_error_
             .header("authorization", "Bearer local-secret")
             .header("content-type", "application/json")
             .header("x-request-id", "client-request-7")
-            .body(Body::from(r#"{"model":"gpt-5.6-sol","input":[]}"#))
+            .body(Body::from(
+                r#"{"model":"gpt-5.6-sol","prompt_cache_key":"private-session-key","input":[]}"#,
+            ))
             .expect("request"),
     )
     .await
@@ -306,5 +441,12 @@ async fn logs_request_timing_upstream_id_sse_error_and_completion_without_error_
     assert!(logs.contains("total_ms="));
     assert!(logs.contains("outcome=\"sse_error\""));
     assert!(logs.contains("filtered_keepalive_events=1"));
+    assert!(logs.contains("prompt_cache_key_present=true"));
+    assert!(logs.contains("prompt_cache_key_fingerprint="));
+    assert!(logs.contains("cache_usage_present=true"));
+    assert!(logs.contains("input_tokens=1000"));
+    assert!(logs.contains("cached_input_tokens=750"));
+    assert!(logs.contains("cache_hit_ratio_pct=75"));
+    assert!(!logs.contains("private-session-key"));
     assert!(!logs.contains("diagnostic-body-must-not-be-logged"));
 }

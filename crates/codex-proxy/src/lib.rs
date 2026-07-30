@@ -1,6 +1,7 @@
 //! Loopback-only Responses API proxy.
 
 use std::{
+    collections::HashMap,
     sync::{
         Arc,
         atomic::{AtomicU64, Ordering},
@@ -23,6 +24,7 @@ use codex_protocol::{
 };
 use futures_util::StreamExt;
 use serde_json::{Value, json};
+use sha2::{Digest, Sha256};
 use thiserror::Error;
 use tokio::sync::{Mutex, Semaphore};
 use url::Url;
@@ -106,6 +108,7 @@ pub struct ProxyConfig {
     local_secret: String,
     body_limit: usize,
     max_concurrency: usize,
+    reasoning_options: HashMap<String, TransformOptions>,
     allow_test_upstream: bool,
 }
 
@@ -116,6 +119,7 @@ impl ProxyConfig {
             local_secret: local_secret.into(),
             body_limit: DEFAULT_BODY_LIMIT,
             max_concurrency: DEFAULT_MAX_CONCURRENCY,
+            reasoning_options: HashMap::new(),
             allow_test_upstream: false,
         })
     }
@@ -129,6 +133,7 @@ impl ProxyConfig {
             local_secret: local_secret.into(),
             body_limit: DEFAULT_BODY_LIMIT,
             max_concurrency: DEFAULT_MAX_CONCURRENCY,
+            reasoning_options: HashMap::new(),
             allow_test_upstream: true,
         }
     }
@@ -137,6 +142,37 @@ impl ProxyConfig {
         self.body_limit = body_limit;
         self.max_concurrency = max_concurrency;
         self
+    }
+
+    pub fn with_model_reasoning(
+        mut self,
+        model: impl Into<String>,
+        allowed_reasoning_efforts: Vec<String>,
+        default_reasoning_effort: Option<String>,
+    ) -> Self {
+        if allowed_reasoning_efforts.is_empty() {
+            return self;
+        }
+        let default_reasoning_effort = default_reasoning_effort
+            .filter(|default| allowed_reasoning_efforts.contains(default))
+            .unwrap_or_else(|| allowed_reasoning_efforts[0].clone());
+        self.reasoning_options.insert(
+            model.into(),
+            TransformOptions {
+                allowed_reasoning_efforts,
+                default_reasoning_effort,
+            },
+        );
+        self
+    }
+
+    fn transform_options(&self, request: &Value) -> TransformOptions {
+        request
+            .get("model")
+            .and_then(Value::as_str)
+            .and_then(|model| self.reasoning_options.get(model))
+            .cloned()
+            .unwrap_or_default()
     }
 
     fn validate(&self) -> Result<(), ProxyError> {
@@ -222,10 +258,12 @@ async fn proxy_responses(
             return error_response(StatusCode::BAD_REQUEST, "request body must be valid JSON");
         }
     };
-    let transformed = match transform_responses_request(parsed, &TransformOptions::default()) {
+    let transform_options = state.config.transform_options(&parsed);
+    let mut transformed = match transform_responses_request(parsed, &transform_options) {
         Ok(transformed) => transformed,
         Err(error) => return error_response(StatusCode::BAD_REQUEST, &error.to_string()),
     };
+    let prompt_cache_key = resolve_prompt_cache_key(&mut transformed, &headers);
     let diagnostics = RequestDiagnostics::new(request_started_at, &headers, &transformed);
     diagnostics.log_received();
     let encoded = match serde_json::to_vec(&transformed) {
@@ -248,6 +286,7 @@ async fn proxy_responses(
         &encoded,
         &credential,
         &diagnostics.client_request_id,
+        prompt_cache_key.as_deref(),
     )
     .await
     {
@@ -270,6 +309,7 @@ async fn proxy_responses(
             &encoded,
             &refreshed,
             &diagnostics.client_request_id,
+            prompt_cache_key.as_deref(),
         )
         .await
         {
@@ -309,17 +349,39 @@ fn constant_time_equal(left: &[u8], right: &[u8]) -> bool {
         == 0
 }
 
+fn resolve_prompt_cache_key(request: &mut Value, headers: &HeaderMap) -> Option<String> {
+    if let Some(key) = request
+        .get("prompt_cache_key")
+        .and_then(Value::as_str)
+        .filter(|key| !key.is_empty())
+    {
+        return Some(key.to_owned());
+    }
+
+    let key = headers
+        .get("x-grok-session-id")
+        .and_then(|value| value.to_str().ok())
+        .filter(|key| !key.is_empty())?
+        .to_owned();
+    request
+        .as_object_mut()?
+        .insert("prompt_cache_key".to_owned(), Value::String(key.clone()));
+    Some(key)
+}
+
 async fn send_upstream(
     state: &AppState,
     incoming_headers: &HeaderMap,
     body: &[u8],
     credential: &AccessCredential,
     request_id: &str,
+    prompt_cache_key: Option<&str>,
 ) -> Result<reqwest::Response, String> {
     let mut headers = build_upstream_headers(
         incoming_headers,
         &credential.access_token,
         &credential.account_id,
+        prompt_cache_key,
     )
     .map_err(|error| error.to_string())?;
     if !headers.contains_key("x-request-id") {
@@ -342,6 +404,7 @@ async fn stream_response(upstream: reqwest::Response, diagnostics: RequestDiagno
     let source_headers = upstream.headers().clone();
     if !status.is_success() {
         let body = upstream.bytes().await.unwrap_or_default();
+        let response_status = normalize_upstream_error_status(status, &body);
         tracing::warn!(
             upstream_status = %status,
             upstream_error = %sanitize_error_body(&body),
@@ -351,12 +414,14 @@ async fn stream_response(upstream: reqwest::Response, diagnostics: RequestDiagno
             "http_error",
             &header_value(&source_headers, "x-request-id"),
             None,
-            body.len(),
-            1,
-            0,
+            CompletionMetrics {
+                bytes_received: body.len(),
+                chunks_received: 1,
+                ..CompletionMetrics::default()
+            },
         );
         let mut response = Response::new(Body::from(body));
-        *response.status_mut() = status;
+        *response.status_mut() = response_status;
         copy_response_headers(&source_headers, &mut response);
         return response;
     }
@@ -366,6 +431,28 @@ async fn stream_response(upstream: reqwest::Response, diagnostics: RequestDiagno
     *response.status_mut() = status;
     copy_response_headers(&source_headers, &mut response);
     response
+}
+
+fn normalize_upstream_error_status(status: reqwest::StatusCode, body: &[u8]) -> StatusCode {
+    if status != reqwest::StatusCode::NOT_FOUND {
+        return StatusCode::from_u16(status.as_u16()).unwrap_or(StatusCode::BAD_GATEWAY);
+    }
+    let usage_limited = std::str::from_utf8(body).ok().is_some_and(|body| {
+        let normalized = body.to_ascii_lowercase();
+        [
+            "usage_limit_reached",
+            "usage_not_included",
+            "rate_limit_exceeded",
+            "usage limit",
+        ]
+        .iter()
+        .any(|marker| normalized.contains(marker))
+    });
+    if usage_limited {
+        StatusCode::TOO_MANY_REQUESTS
+    } else {
+        StatusCode::NOT_FOUND
+    }
 }
 
 fn bridge_sse_stream(
@@ -421,6 +508,7 @@ struct RequestDiagnostics {
     started_at: Instant,
     client_request_id: String,
     model: String,
+    prompt_cache_key_fingerprint: Option<String>,
 }
 
 impl RequestDiagnostics {
@@ -443,6 +531,11 @@ impl RequestDiagnostics {
                 .and_then(Value::as_str)
                 .unwrap_or("<missing>")
                 .to_owned(),
+            prompt_cache_key_fingerprint: request
+                .get("prompt_cache_key")
+                .and_then(Value::as_str)
+                .filter(|key| !key.is_empty())
+                .map(cache_key_fingerprint),
         }
     }
 
@@ -450,6 +543,11 @@ impl RequestDiagnostics {
         tracing::info!(
             client_request_id = self.client_request_id.as_str(),
             model = self.model.as_str(),
+            prompt_cache_key_present = self.prompt_cache_key_fingerprint.is_some(),
+            prompt_cache_key_fingerprint = self
+                .prompt_cache_key_fingerprint
+                .as_deref()
+                .unwrap_or("<none>"),
             "Codex proxy request received"
         );
     }
@@ -483,10 +581,16 @@ impl RequestDiagnostics {
         outcome: &str,
         upstream_request_id: &str,
         sse_error_type: Option<&str>,
-        bytes_received: usize,
-        chunks_received: u64,
-        filtered_keepalive_events: u64,
+        metrics: CompletionMetrics,
     ) {
+        let cache_usage_present = metrics.input_tokens.is_some();
+        let input_tokens = metrics.input_tokens.unwrap_or(0);
+        let cached_input_tokens = metrics.cached_input_tokens.unwrap_or(0);
+        let cache_hit_ratio_pct = if input_tokens == 0 {
+            0.0
+        } else {
+            cached_input_tokens as f64 * 100.0 / input_tokens as f64
+        };
         tracing::info!(
             client_request_id = self.client_request_id.as_str(),
             upstream_request_id,
@@ -494,12 +598,32 @@ impl RequestDiagnostics {
             outcome,
             sse_error_type = sse_error_type.unwrap_or("<none>"),
             total_ms = elapsed_ms(self.started_at),
-            bytes_received,
-            chunks_received,
-            filtered_keepalive_events,
+            bytes_received = metrics.bytes_received,
+            chunks_received = metrics.chunks_received,
+            filtered_keepalive_events = metrics.filtered_keepalive_events,
+            cache_usage_present,
+            input_tokens,
+            cached_input_tokens,
+            cache_hit_ratio_pct,
             "Codex proxy request completed"
         );
     }
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+struct CompletionMetrics {
+    bytes_received: usize,
+    chunks_received: u64,
+    filtered_keepalive_events: u64,
+    input_tokens: Option<u64>,
+    cached_input_tokens: Option<u64>,
+}
+
+fn cache_key_fingerprint(key: &str) -> String {
+    Sha256::digest(key.as_bytes())[..8]
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
 }
 
 struct StreamDiagnostics {
@@ -510,6 +634,8 @@ struct StreamDiagnostics {
     bytes_received: usize,
     chunks_received: u64,
     filtered_keepalive_events: u64,
+    input_tokens: Option<u64>,
+    cached_input_tokens: Option<u64>,
     finished: bool,
 }
 
@@ -523,6 +649,8 @@ impl StreamDiagnostics {
             bytes_received: 0,
             chunks_received: 0,
             filtered_keepalive_events: 0,
+            input_tokens: None,
+            cached_input_tokens: None,
             finished: false,
         }
     }
@@ -545,6 +673,10 @@ impl StreamDiagnostics {
     }
 
     fn observe_event(&mut self, event: &[u8]) {
+        if let Some((input_tokens, cached_input_tokens)) = extract_cache_usage(event) {
+            self.input_tokens = Some(input_tokens);
+            self.cached_input_tokens = Some(cached_input_tokens);
+        }
         let Some(error_type) = extract_sse_error_type(event) else {
             return;
         };
@@ -582,10 +714,18 @@ impl StreamDiagnostics {
             outcome,
             &self.upstream_request_id,
             self.sse_error_type.as_deref(),
-            self.bytes_received,
-            self.chunks_received,
-            self.filtered_keepalive_events,
+            self.completion_metrics(),
         );
+    }
+
+    fn completion_metrics(&self) -> CompletionMetrics {
+        CompletionMetrics {
+            bytes_received: self.bytes_received,
+            chunks_received: self.chunks_received,
+            filtered_keepalive_events: self.filtered_keepalive_events,
+            input_tokens: self.input_tokens,
+            cached_input_tokens: self.cached_input_tokens,
+        }
     }
 }
 
@@ -596,12 +736,31 @@ impl Drop for StreamDiagnostics {
                 "client_disconnected",
                 &self.upstream_request_id,
                 self.sse_error_type.as_deref(),
-                self.bytes_received,
-                self.chunks_received,
-                self.filtered_keepalive_events,
+                self.completion_metrics(),
             );
         }
     }
+}
+
+fn extract_cache_usage(event: &[u8]) -> Option<(u64, u64)> {
+    let text = std::str::from_utf8(event).ok()?;
+    let data = text.lines().find_map(|line| {
+        line.strip_prefix("data:")
+            .map(str::trim_start)
+            .filter(|data| !data.is_empty() && *data != "[DONE]")
+    })?;
+    let value = serde_json::from_str::<Value>(data).ok()?;
+    let input_tokens = ["/response/usage/input_tokens", "/usage/input_tokens"]
+        .iter()
+        .find_map(|pointer| value.pointer(pointer).and_then(Value::as_u64))?;
+    let cached_input_tokens = [
+        "/response/usage/input_tokens_details/cached_tokens",
+        "/usage/input_tokens_details/cached_tokens",
+    ]
+    .iter()
+    .find_map(|pointer| value.pointer(pointer).and_then(Value::as_u64))
+    .unwrap_or(0);
+    Some((input_tokens, cached_input_tokens))
 }
 
 fn extract_sse_error_type(event: &[u8]) -> Option<String> {
@@ -724,8 +883,11 @@ pub enum ProxyError {
 
 #[cfg(test)]
 mod tests {
-    use super::{RequestDiagnostics, extract_sse_error_type, sanitize_error_body};
-    use http::HeaderMap;
+    use super::{
+        RequestDiagnostics, extract_sse_error_type, normalize_upstream_error_status,
+        sanitize_error_body,
+    };
+    use http::{HeaderMap, StatusCode};
     use serde_json::json;
     use std::time::Instant;
 
@@ -772,5 +934,27 @@ mod tests {
 
         assert!(diagnostics.client_request_id.starts_with("proxy-"));
         assert_ne!(diagnostics.client_request_id, "<missing>");
+    }
+
+    #[test]
+    fn only_usage_related_404_errors_are_normalized_to_rate_limits() {
+        for code in [
+            "usage_limit_reached",
+            "usage_not_included",
+            "rate_limit_exceeded",
+        ] {
+            let body = format!(r#"{{"error":{{"code":"{code}"}}}}"#);
+            assert_eq!(
+                normalize_upstream_error_status(reqwest::StatusCode::NOT_FOUND, body.as_bytes()),
+                StatusCode::TOO_MANY_REQUESTS
+            );
+        }
+        assert_eq!(
+            normalize_upstream_error_status(
+                reqwest::StatusCode::NOT_FOUND,
+                br#"{"error":{"code":"model_not_found"}}"#
+            ),
+            StatusCode::NOT_FOUND
+        );
     }
 }
