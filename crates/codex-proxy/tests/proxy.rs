@@ -192,6 +192,7 @@ struct WebSocketCaptures {
 #[derive(Clone, Default)]
 struct ReuseWebSocketCaptures {
     connections: Arc<AtomicUsize>,
+    pongs: Arc<AtomicUsize>,
     requests: Arc<Mutex<Vec<Value>>>,
 }
 
@@ -296,6 +297,31 @@ async fn spawn_reusing_websocket_upstream(captures: ReuseWebSocketCaptures) -> S
                         ))
                         .await
                         .expect("send trailing reusable metadata");
+                    websocket
+                        .send(Message::Text(
+                            json!({"type": "keepalive"}).to_string().into(),
+                        ))
+                        .await
+                        .expect("send idle reusable keepalive");
+                    websocket
+                        .send(Message::Ping(
+                            format!("idle-ping-{request_index}").into_bytes().into(),
+                        ))
+                        .await
+                        .expect("send idle reusable ping");
+                    let pong = tokio::time::timeout(
+                        std::time::Duration::from_millis(250),
+                        websocket.next(),
+                    )
+                    .await
+                    .expect("idle ping must receive a prompt pong")
+                    .expect("websocket remains open after idle ping")
+                    .expect("valid idle pong");
+                    assert!(
+                        matches!(pong, Message::Pong(_)),
+                        "expected idle pong, got {pong:?}"
+                    );
+                    captures.pongs.fetch_add(1, Ordering::SeqCst);
                 }
             });
         }
@@ -695,7 +721,7 @@ async fn websocket_connection_and_previous_response_are_reused_conservatively() 
         "output": "done"
     });
 
-    for (request_id, input) in [
+    for (request_index, (request_id, input)) in [
         ("reuse-1", json!([user_one.clone()])),
         (
             "reuse-2",
@@ -721,7 +747,10 @@ async fn websocket_connection_and_previous_response_are_reused_conservatively() 
                 function_output.clone()
             ]),
         ),
-    ] {
+    ]
+    .into_iter()
+    .enumerate()
+    {
         let response = tower::ServiceExt::oneshot(
             app.clone(),
             axum::http::Request::post("/v1/responses")
@@ -737,11 +766,24 @@ async fn websocket_connection_and_previous_response_are_reused_conservatively() 
         .await
         .expect("response");
         assert_eq!(response.status(), StatusCode::OK);
-        response
+        let body = response
             .into_body()
             .collect()
             .await
-            .expect("collect reusable websocket response");
+            .expect("collect reusable websocket response")
+            .to_bytes();
+        assert!(
+            !body
+                .windows(br#""type":"keepalive""#.len())
+                .any(|part| part == br#""type":"keepalive""#)
+        );
+        tokio::time::timeout(std::time::Duration::from_millis(250), async {
+            while websocket_captures.pongs.load(Ordering::SeqCst) <= request_index {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("proxy must answer websocket pings while idle between requests");
     }
 
     assert_eq!(websocket_captures.connections.load(Ordering::SeqCst), 1);

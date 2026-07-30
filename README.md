@@ -89,12 +89,14 @@ represent it.
 The daemon prefers the Codex Responses WebSocket v2 transport and automatically falls back to
 HTTP/SSE when the WebSocket handshake or initial send is unavailable. Grok still receives an SSE
 response, so no Grok-side protocol change is required. Requests from the same Grok session reuse
-one serialized WebSocket connection. When the complete next input is a safe extension of the
-previous turn and all other request properties are unchanged, the proxy sends only the input delta
-with `previous_response_id`; otherwise it conservatively sends the full request. Codex turn state
-is retained for tool continuations and reset when a new user turn begins. Closed connections,
-initial send failures, authorization expiry, and missing previous responses are reconnected or
-retried automatically before falling back to HTTP/SSE.
+one serialized WebSocket connection. A background connection pump continues reading between turns,
+answers WebSocket Ping frames with Pong, and safely queues or filters private keepalive events.
+When the complete next input is a safe extension of the previous turn and all other request
+properties are unchanged, the proxy sends only the input delta with `previous_response_id`;
+otherwise it conservatively sends the full request. Codex turn state is retained for tool
+continuations and reset when a new user turn begins. Closed connections, initial send failures,
+authorization expiry, and missing previous responses are reconnected or retried automatically
+before falling back to HTTP/SSE.
 
 The daemon writes timestamped request metadata to `~/.grok/codex-oauth/daemon.log`. Each valid
 proxy request records the selected upstream transport, model and client request ID, upstream status

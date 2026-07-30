@@ -29,11 +29,12 @@ use sha2::{Digest, Sha256};
 use thiserror::Error;
 use tokio::{
     net::TcpStream,
-    sync::{Mutex, OwnedMutexGuard, Semaphore},
+    sync::{Mutex, OwnedMutexGuard, Semaphore, mpsc, oneshot},
+    task::JoinHandle,
 };
 use tokio_tungstenite::{
     MaybeTlsStream, WebSocketStream, connect_async,
-    tungstenite::{Message, client::IntoClientRequest},
+    tungstenite::{Error as WebSocketError, Message, client::IntoClientRequest},
 };
 use url::Url;
 
@@ -42,7 +43,112 @@ const DEFAULT_BODY_LIMIT: usize = 16 * 1024 * 1024;
 const DEFAULT_MAX_CONCURRENCY: usize = 4;
 const MAX_CACHED_WEBSOCKET_SESSIONS: usize = 64;
 static REQUEST_SEQUENCE: AtomicU64 = AtomicU64::new(1);
-type CodexWebSocket = WebSocketStream<MaybeTlsStream<TcpStream>>;
+type RawCodexWebSocket = WebSocketStream<MaybeTlsStream<TcpStream>>;
+
+struct CodexWebSocketPump {
+    tx_command: mpsc::Sender<WebSocketCommand>,
+    rx_message: mpsc::UnboundedReceiver<Result<Message, WebSocketError>>,
+    pump_task: JoinHandle<()>,
+}
+
+enum WebSocketCommand {
+    Send {
+        message: Message,
+        tx_result: oneshot::Sender<Result<(), WebSocketError>>,
+    },
+}
+
+impl CodexWebSocketPump {
+    fn new(websocket: RawCodexWebSocket) -> Self {
+        let (tx_command, mut rx_command) = mpsc::channel::<WebSocketCommand>(32);
+        let (tx_message, rx_message) = mpsc::unbounded_channel::<Result<Message, WebSocketError>>();
+        let pump_task = tokio::spawn(async move {
+            let mut websocket = websocket;
+            loop {
+                tokio::select! {
+                    command = rx_command.recv() => {
+                        let Some(command) = command else {
+                            break;
+                        };
+                        match command {
+                            WebSocketCommand::Send { message, tx_result } => {
+                                let result = websocket.send(message).await;
+                                let failed = result.is_err();
+                                let _ = tx_result.send(result);
+                                if failed {
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                    message = websocket.next() => {
+                        let Some(message) = message else {
+                            break;
+                        };
+                        match message {
+                            Ok(Message::Ping(payload)) => {
+                                if let Err(error) = websocket.send(Message::Pong(payload)).await {
+                                    let _ = tx_message.send(Err(error));
+                                    break;
+                                }
+                            }
+                            Ok(Message::Pong(_)) => {}
+                            Ok(message @ (
+                                Message::Text(_)
+                                | Message::Binary(_)
+                                | Message::Close(_)
+                                | Message::Frame(_)
+                            )) => {
+                                let is_close = matches!(message, Message::Close(_));
+                                if tx_message.send(Ok(message)).is_err() || is_close {
+                                    break;
+                                }
+                            }
+                            Err(error) => {
+                                let _ = tx_message.send(Err(error));
+                                break;
+                            }
+                        }
+                    }
+                }
+            }
+        });
+        Self {
+            tx_command,
+            rx_message,
+            pump_task,
+        }
+    }
+
+    async fn send(&self, message: Message) -> Result<(), WebSocketError> {
+        let (tx_result, rx_result) = oneshot::channel();
+        if self
+            .tx_command
+            .send(WebSocketCommand::Send { message, tx_result })
+            .await
+            .is_err()
+        {
+            return Err(WebSocketError::ConnectionClosed);
+        }
+        rx_result
+            .await
+            .unwrap_or(Err(WebSocketError::ConnectionClosed))
+    }
+
+    async fn next(&mut self) -> Option<Result<Message, WebSocketError>> {
+        self.rx_message.recv().await
+    }
+
+    fn is_closed(&self) -> bool {
+        self.pump_task.is_finished() || self.tx_command.is_closed()
+    }
+}
+
+impl Drop for CodexWebSocketPump {
+    fn drop(&mut self) {
+        self.pump_task.abort();
+    }
+}
 
 #[async_trait]
 pub trait CredentialProvider: Send + Sync {
@@ -272,7 +378,7 @@ struct WebSocketSessionPool {
 
 #[derive(Default)]
 struct WebSocketSession {
-    connection: Option<CodexWebSocket>,
+    connection: Option<CodexWebSocketPump>,
     last_request: Option<Value>,
     last_response: Option<CachedWebSocketResponse>,
     turn_state: Option<String>,
@@ -555,7 +661,11 @@ async fn send_websocket_upstream(
     let session_key = websocket_session_key(&credential.account_id, ids);
     let session = state.websocket_sessions.get(session_key).await;
     let mut session = session.lock_owned().await;
-    if session.connection.is_some() && !cached_websocket_is_usable(&mut session).await {
+    if session
+        .connection
+        .as_ref()
+        .is_some_and(CodexWebSocketPump::is_closed)
+    {
         reset_websocket_session(&mut session);
     }
     let mut prepared = prepare_websocket_request(request, &session);
@@ -663,7 +773,7 @@ async fn connect_websocket_with_refresh(
     request_id: &str,
     ids: &UpstreamRequestIds,
     diagnostics: &RequestDiagnostics,
-) -> Result<(CodexWebSocket, Option<String>), String> {
+) -> Result<(CodexWebSocketPump, Option<String>), String> {
     match connect_websocket_upstream(
         state,
         incoming_headers,
@@ -692,37 +802,6 @@ async fn connect_websocket_with_refresh(
     }
 }
 
-async fn cached_websocket_is_usable(session: &mut WebSocketSession) -> bool {
-    let Some(websocket) = session.connection.as_mut() else {
-        return false;
-    };
-    // Codex can enqueue private timing/metadata events immediately after the public terminal
-    // response. Drain only those known internal events before deciding whether the cached
-    // connection is still reusable; an unknown data frame remains a protocol-state mismatch.
-    for _ in 0..16 {
-        match tokio::time::timeout(Duration::from_millis(1), websocket.next()).await {
-            Err(_) => return true,
-            Ok(Some(Ok(Message::Ping(payload)))) => {
-                if websocket.send(Message::Pong(payload)).await.is_err() {
-                    return false;
-                }
-            }
-            Ok(Some(Ok(Message::Pong(_)))) => {}
-            Ok(Some(Ok(Message::Text(text)))) if is_internal_websocket_event(text.as_str()) => {
-                if let Some(turn_state) = websocket_event_turn_state(text.as_str()) {
-                    session.turn_state = Some(turn_state);
-                }
-            }
-            Ok(Some(Ok(
-                Message::Close(_) | Message::Text(_) | Message::Binary(_) | Message::Frame(_),
-            )))
-            | Ok(Some(Err(_)))
-            | Ok(None) => return false,
-        }
-    }
-    true
-}
-
 fn reset_websocket_session(session: &mut WebSocketSession) {
     session.connection = None;
     session.last_request = None;
@@ -737,7 +816,7 @@ async fn connect_websocket_upstream(
     request_id: &str,
     ids: &UpstreamRequestIds,
     diagnostics: &RequestDiagnostics,
-) -> Result<(CodexWebSocket, Option<String>), WebSocketConnectError> {
+) -> Result<(CodexWebSocketPump, Option<String>), WebSocketConnectError> {
     let websocket_url = state.config.websocket_url.as_ref().ok_or_else(|| {
         WebSocketConnectError::Other("websocket upstream is disabled".to_string())
     })?;
@@ -796,7 +875,7 @@ async fn connect_websocket_upstream(
         .get("x-codex-turn-state")
         .and_then(|value| value.to_str().ok())
         .map(str::to_owned);
-    Ok((websocket, turn_state))
+    Ok((CodexWebSocketPump::new(websocket), turn_state))
 }
 
 enum WebSocketConnectError {
