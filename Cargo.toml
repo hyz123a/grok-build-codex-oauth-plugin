@@ -34,6 +34,7 @@ keyring = { version = "3", features = [
     "vendored",
 ] }
 rand = "0.9"
+percent-encoding = "2"
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "stream"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"

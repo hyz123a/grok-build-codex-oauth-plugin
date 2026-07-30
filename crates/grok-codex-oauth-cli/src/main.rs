@@ -25,11 +25,14 @@ use codex_oauth::{
     CredentialStore, OAuthClient, OAuthConfig, PkceCodes, SystemCredentialStore,
     build_authorize_url, generate_state, validate_callback,
 };
-use codex_proxy::{CredentialProvider, ProxyConfig, StoredCredentialProvider, build_router};
+use codex_proxy::{
+    CredentialProvider, ProxyConfig, StoredCredentialProvider, build_router,
+    websocket_proxy_configured_from_env,
+};
 use directories::BaseDirs;
 use grok_config::{
-    MANAGED_MODEL_ALIASES, ModelConfig, SelectableModel, install_model_catalog, read_model_config,
-    replace_model_catalog, uninstall_model_aliases,
+    BUILTIN_CODEX_MODEL_CATALOG, MANAGED_MODEL_ALIASES, ModelConfig, SelectableModel,
+    install_model_catalog, read_model_config, replace_model_catalog, uninstall_model_aliases,
 };
 use rand::RngCore;
 use tokio::sync::{Mutex, oneshot};
@@ -508,10 +511,17 @@ async fn serve(paths: &AppPaths, port: u16) -> Result<()> {
         Arc::new(paths.store()),
         OAuthClient::new(OAuthConfig::default()),
     ));
-    let mut proxy_config = ProxyConfig::production(secret)?;
+    let mut allowed_models = BUILTIN_CODEX_MODEL_CATALOG
+        .iter()
+        .map(|(_, model, _)| (*model).to_string())
+        .collect::<Vec<_>>();
+    let mut proxy_config = ProxyConfig::production(secret)?.with_websocket_proxy_from_env()?;
     match load_cached_catalog(&paths.models_cache) {
         Ok(Some(models)) => {
             for model in models {
+                if !allowed_models.contains(&model.slug) {
+                    allowed_models.push(model.slug.clone());
+                }
                 proxy_config = proxy_config.with_model_reasoning(
                     model.slug,
                     model.supported_reasoning_efforts,
@@ -527,6 +537,7 @@ async fn serve(paths: &AppPaths, port: u16) -> Result<()> {
             );
         }
     }
+    proxy_config = proxy_config.with_allowed_models(allowed_models);
     let app = build_router(proxy_config, credentials)?;
     let address = SocketAddr::from(([127, 0, 0, 1], port));
     let listener = tokio::net::TcpListener::bind(address)
@@ -560,8 +571,23 @@ async fn shutdown_signal() {
 }
 
 async fn ensure_daemon(paths: &AppPaths, port: u16) -> Result<()> {
-    if health(port).await {
-        return Ok(());
+    let expected_websocket_proxy = websocket_proxy_configured_from_env()?;
+    if let Some(active_websocket_proxy) = health_status(port).await {
+        if active_websocket_proxy == expected_websocket_proxy {
+            return Ok(());
+        }
+        tracing::info!(
+            active_websocket_proxy,
+            expected_websocket_proxy,
+            "Restarting Codex OAuth daemon because outbound proxy configuration changed"
+        );
+        stop_daemon(paths)?;
+        for _ in 0..40 {
+            if health_status(port).await.is_none() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
     }
     if paths.store().load().await?.is_none() {
         eprintln!("Codex OAuth is not logged in; daemon was not started.");
@@ -883,12 +909,25 @@ async fn doctor(paths: &AppPaths, port: u16) -> Result<()> {
 }
 
 async fn health(port: u16) -> bool {
-    reqwest::Client::new()
+    health_status(port).await.is_some()
+}
+
+async fn health_status(port: u16) -> Option<bool> {
+    let response = reqwest::Client::new()
         .get(format!("http://127.0.0.1:{port}/health"))
         .timeout(Duration::from_millis(300))
         .send()
         .await
-        .is_ok_and(|response| response.status().is_success())
+        .ok()?;
+    if !response.status().is_success() {
+        return None;
+    }
+    let body = response.json::<serde_json::Value>().await.ok()?;
+    Some(
+        body.get("websocket_proxy")
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(false),
+    )
 }
 
 fn read_secret(paths: &AppPaths) -> Result<String> {

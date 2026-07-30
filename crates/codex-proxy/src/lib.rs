@@ -1,7 +1,7 @@
 //! Loopback-only Responses API proxy.
 
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     sync::{
         Arc,
         atomic::{AtomicU64, Ordering},
@@ -18,22 +18,25 @@ use axum::{
     response::{IntoResponse, Response},
     routing::{get, post},
 };
+use base64::{Engine, engine::general_purpose::STANDARD};
 use codex_oauth::{AccessCredential, CredentialStore, Credentials, OAuthClient};
 use codex_protocol::{
     CodexSseTransformer, TransformOptions, UpstreamRequestIds, build_upstream_headers,
     transform_responses_request,
 };
 use futures_util::{SinkExt, StreamExt};
+use percent_encoding::percent_decode_str;
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use thiserror::Error;
 use tokio::{
+    io::{AsyncReadExt, AsyncWriteExt},
     net::TcpStream,
     sync::{Mutex, OwnedMutexGuard, Semaphore, mpsc, oneshot},
     task::JoinHandle,
 };
 use tokio_tungstenite::{
-    MaybeTlsStream, WebSocketStream, connect_async,
+    MaybeTlsStream, WebSocketStream, client_async_tls_with_config,
     tungstenite::{Error as WebSocketError, Message, client::IntoClientRequest},
 };
 use url::Url;
@@ -42,8 +45,16 @@ pub const CODEX_RESPONSES_URL: &str = "https://chatgpt.com/backend-api/codex/res
 const DEFAULT_BODY_LIMIT: usize = 16 * 1024 * 1024;
 const DEFAULT_MAX_CONCURRENCY: usize = 4;
 const MAX_CACHED_WEBSOCKET_SESSIONS: usize = 64;
+const DEFAULT_WEBSOCKET_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+const DEFAULT_HTTP_RESPONSE_HEADERS_TIMEOUT: Duration = Duration::from_secs(30);
+const MAX_PROXY_RESPONSE_HEADERS: usize = 16 * 1024;
 static REQUEST_SEQUENCE: AtomicU64 = AtomicU64::new(1);
 type RawCodexWebSocket = WebSocketStream<MaybeTlsStream<TcpStream>>;
+
+pub fn websocket_proxy_configured_from_env() -> Result<bool, ProxyError> {
+    let upstream = Url::parse(CODEX_RESPONSES_URL)?;
+    Ok(proxy_url_from_environment(&websocket_url(&upstream))?.is_some())
+}
 
 struct CodexWebSocketPump {
     tx_command: mpsc::Sender<WebSocketCommand>,
@@ -227,6 +238,10 @@ pub struct ProxyConfig {
     body_limit: usize,
     max_concurrency: usize,
     reasoning_options: HashMap<String, TransformOptions>,
+    allowed_models: Option<HashSet<String>>,
+    websocket_proxy: Option<Url>,
+    websocket_connect_timeout: Duration,
+    http_response_headers_timeout: Duration,
     allow_test_upstream: bool,
 }
 
@@ -242,6 +257,10 @@ impl ProxyConfig {
             body_limit: DEFAULT_BODY_LIMIT,
             max_concurrency: DEFAULT_MAX_CONCURRENCY,
             reasoning_options: HashMap::new(),
+            allowed_models: Some(HashSet::new()),
+            websocket_proxy: None,
+            websocket_connect_timeout: DEFAULT_WEBSOCKET_CONNECT_TIMEOUT,
+            http_response_headers_timeout: DEFAULT_HTTP_RESPONSE_HEADERS_TIMEOUT,
             allow_test_upstream: false,
         })
     }
@@ -259,6 +278,10 @@ impl ProxyConfig {
             body_limit: DEFAULT_BODY_LIMIT,
             max_concurrency: DEFAULT_MAX_CONCURRENCY,
             reasoning_options: HashMap::new(),
+            allowed_models: None,
+            websocket_proxy: None,
+            websocket_connect_timeout: DEFAULT_WEBSOCKET_CONNECT_TIMEOUT,
+            http_response_headers_timeout: DEFAULT_HTTP_RESPONSE_HEADERS_TIMEOUT,
             allow_test_upstream: true,
         }
     }
@@ -276,6 +299,37 @@ impl ProxyConfig {
 
     pub fn with_websocket_upstream(mut self, upstream_url: impl AsRef<str>) -> Self {
         self.websocket_url = Url::parse(upstream_url.as_ref()).ok();
+        self
+    }
+
+    pub fn with_websocket_proxy(mut self, proxy_url: impl AsRef<str>) -> Result<Self, ProxyError> {
+        self.websocket_proxy = Some(validate_websocket_proxy(proxy_url.as_ref())?);
+        Ok(self)
+    }
+
+    pub fn with_websocket_proxy_from_env(mut self) -> Result<Self, ProxyError> {
+        let Some(upstream) = self.websocket_url.as_ref() else {
+            return Ok(self);
+        };
+        self.websocket_proxy = proxy_url_from_environment(upstream)?;
+        Ok(self)
+    }
+
+    pub fn with_allowed_models(
+        mut self,
+        models: impl IntoIterator<Item = impl Into<String>>,
+    ) -> Self {
+        self.allowed_models = Some(models.into_iter().map(Into::into).collect());
+        self
+    }
+
+    pub fn with_upstream_timeouts(
+        mut self,
+        websocket_connect: Duration,
+        http_response_headers: Duration,
+    ) -> Self {
+        self.websocket_connect_timeout = websocket_connect;
+        self.http_response_headers_timeout = http_response_headers;
         self
     }
 
@@ -320,6 +374,10 @@ impl ProxyConfig {
         if self.body_limit == 0 || self.max_concurrency == 0 {
             return Err(ProxyError::InvalidLimit);
         }
+        if self.websocket_connect_timeout.is_zero() || self.http_response_headers_timeout.is_zero()
+        {
+            return Err(ProxyError::InvalidTimeout);
+        }
         if !self.allow_test_upstream && self.upstream_url.as_str() != CODEX_RESPONSES_URL {
             return Err(ProxyError::UpstreamNotAllowed);
         }
@@ -351,6 +409,69 @@ fn is_loopback_url(url: &Url) -> bool {
     url.host_str()
         .and_then(|host| host.parse::<std::net::IpAddr>().ok())
         .is_some_and(|address| address.is_loopback())
+}
+
+fn validate_websocket_proxy(proxy_url: &str) -> Result<Url, ProxyError> {
+    let proxy = Url::parse(proxy_url)?;
+    if proxy.scheme() != "http" || proxy.host_str().is_none() {
+        return Err(ProxyError::UnsupportedWebSocketProxy);
+    }
+    Ok(proxy)
+}
+
+fn proxy_url_from_environment(upstream: &Url) -> Result<Option<Url>, ProxyError> {
+    proxy_url_from_values(upstream, |name| std::env::var(name).ok())
+}
+
+fn proxy_url_from_values(
+    upstream: &Url,
+    value: impl Fn(&str) -> Option<String>,
+) -> Result<Option<Url>, ProxyError> {
+    let no_proxy = value("NO_PROXY").or_else(|| value("no_proxy"));
+    if no_proxy
+        .as_deref()
+        .is_some_and(|list| no_proxy_matches(upstream, list))
+    {
+        return Ok(None);
+    }
+    let proxy = value("HTTPS_PROXY")
+        .or_else(|| value("https_proxy"))
+        .or_else(|| value("ALL_PROXY"))
+        .or_else(|| value("all_proxy"));
+    proxy
+        .filter(|proxy| !proxy.trim().is_empty())
+        .map(|proxy| validate_websocket_proxy(proxy.trim()))
+        .transpose()
+}
+
+fn no_proxy_matches(upstream: &Url, list: &str) -> bool {
+    let Some(host) = upstream.host_str() else {
+        return false;
+    };
+    let port = upstream.port_or_known_default();
+    list.split(',').any(|entry| {
+        let entry = entry.trim();
+        if entry == "*" {
+            return true;
+        }
+        if entry.is_empty() {
+            return false;
+        }
+        let (pattern, expected_port) = match entry.rsplit_once(':') {
+            Some((pattern, port)) if port.parse::<u16>().is_ok() => {
+                (pattern, port.parse::<u16>().ok())
+            }
+            _ => (entry, None),
+        };
+        if expected_port.is_some() && expected_port != port {
+            return false;
+        }
+        let pattern = pattern.trim_start_matches('.');
+        host.eq_ignore_ascii_case(pattern)
+            || host
+                .to_ascii_lowercase()
+                .ends_with(&format!(".{}", pattern.to_ascii_lowercase()))
+    })
 }
 
 fn derive_installation_id(local_secret: &str) -> String {
@@ -434,8 +555,11 @@ pub fn build_router(
         .with_state(state))
 }
 
-async fn health() -> Json<Value> {
-    Json(json!({"status": "ok"}))
+async fn health(State(state): State<AppState>) -> Json<Value> {
+    Json(json!({
+        "status": "ok",
+        "websocket_proxy": state.config.websocket_proxy.is_some()
+    }))
 }
 
 async fn proxy_responses(
@@ -462,6 +586,17 @@ async fn proxy_responses(
             return error_response(StatusCode::BAD_REQUEST, "request body must be valid JSON");
         }
     };
+    if let Some(allowed_models) = &state.config.allowed_models {
+        let model = parsed.get("model").and_then(Value::as_str);
+        if !model.is_some_and(|model| allowed_models.contains(model)) {
+            let model = model.unwrap_or("<missing>");
+            tracing::warn!(model, "Rejected unsupported model at Codex proxy boundary");
+            return error_response(
+                StatusCode::BAD_REQUEST,
+                &format!("unsupported Codex model `{model}`"),
+            );
+        }
+    }
     let transform_options = state.config.transform_options(&parsed);
     let mut transformed = match transform_responses_request(parsed, &transform_options) {
         Ok(transformed) => transformed,
@@ -639,14 +774,18 @@ async fn send_upstream(
             .map_err(|_| "invalid proxy request ID".to_string())?;
         headers.insert("x-request-id", request_id);
     }
-    state
-        .client
-        .post(state.config.upstream_url.clone())
-        .headers(headers)
-        .body(body.to_vec())
-        .send()
-        .await
-        .map_err(|_| "Codex upstream request failed".to_string())
+    tokio::time::timeout(
+        state.config.http_response_headers_timeout,
+        state
+            .client
+            .post(state.config.upstream_url.clone())
+            .headers(headers)
+            .body(body.to_vec())
+            .send(),
+    )
+    .await
+    .map_err(|_| "Codex upstream response headers timed out".to_string())?
+    .map_err(|_| "Codex upstream request failed".to_string())
 }
 
 async fn send_websocket_upstream(
@@ -849,25 +988,39 @@ async fn connect_websocket_upstream(
         WebSocketConnectError::Other("failed to build Codex websocket request".to_string())
     })?;
     websocket_request.headers_mut().extend(headers);
-    let (websocket, response) = connect_async(websocket_request).await.map_err(|error| {
-        if matches!(
-            &error,
-            tokio_tungstenite::tungstenite::Error::Http(response)
-                if response.status() == StatusCode::UNAUTHORIZED
-        ) {
-            WebSocketConnectError::Unauthorized
-        } else {
-            WebSocketConnectError::Other(format!(
-                "websocket handshake failed: {}",
-                websocket_error_kind(&error)
-            ))
-        }
-    })?;
+    let connect = async {
+        let socket = connect_websocket_socket(websocket_url, state.config.websocket_proxy.as_ref())
+            .await
+            .map_err(WebSocketConnectError::Other)?;
+        client_async_tls_with_config(websocket_request, socket, None, None)
+            .await
+            .map_err(|error| {
+                if matches!(
+                    &error,
+                    tokio_tungstenite::tungstenite::Error::Http(response)
+                        if response.status() == StatusCode::UNAUTHORIZED
+                ) {
+                    WebSocketConnectError::Unauthorized
+                } else {
+                    WebSocketConnectError::Other(format!(
+                        "websocket handshake failed: {}",
+                        websocket_error_kind(&error)
+                    ))
+                }
+            })
+    };
+    let (websocket, response) =
+        tokio::time::timeout(state.config.websocket_connect_timeout, connect)
+            .await
+            .map_err(|_| {
+                WebSocketConnectError::Other("websocket connection timed out".to_string())
+            })??;
     tracing::info!(
         client_request_id = diagnostics.client_request_id.as_str(),
         model = diagnostics.model.as_str(),
         upstream_status = response.status().as_u16(),
         transport = "websocket",
+        proxy_used = state.config.websocket_proxy.is_some(),
         "Codex upstream WebSocket connected"
     );
     let turn_state = response
@@ -876,6 +1029,102 @@ async fn connect_websocket_upstream(
         .and_then(|value| value.to_str().ok())
         .map(str::to_owned);
     Ok((CodexWebSocketPump::new(websocket), turn_state))
+}
+
+async fn connect_websocket_socket(
+    websocket_url: &Url,
+    proxy: Option<&Url>,
+) -> Result<TcpStream, String> {
+    let host = websocket_url
+        .host_str()
+        .ok_or_else(|| "websocket upstream has no host".to_string())?;
+    let port = websocket_url
+        .port_or_known_default()
+        .ok_or_else(|| "websocket upstream has no port".to_string())?;
+    let authority = format_authority(host, port);
+    let Some(proxy) = proxy else {
+        return TcpStream::connect(&authority)
+            .await
+            .map_err(|_| "failed to connect to websocket upstream".to_string());
+    };
+
+    let proxy_host = proxy
+        .host_str()
+        .ok_or_else(|| "websocket proxy has no host".to_string())?;
+    let proxy_port = proxy.port_or_known_default().unwrap_or(80);
+    let mut socket = TcpStream::connect(format_authority(proxy_host, proxy_port))
+        .await
+        .map_err(|_| "failed to connect to websocket proxy".to_string())?;
+    let authorization = proxy_authorization(proxy)?;
+    let mut request = format!(
+        "CONNECT {authority} HTTP/1.1\r\nHost: {authority}\r\nProxy-Connection: Keep-Alive\r\n"
+    );
+    if let Some(authorization) = authorization {
+        request.push_str("Proxy-Authorization: Basic ");
+        request.push_str(&authorization);
+        request.push_str("\r\n");
+    }
+    request.push_str("\r\n");
+    socket
+        .write_all(request.as_bytes())
+        .await
+        .map_err(|_| "failed to write websocket proxy CONNECT request".to_string())?;
+
+    let mut response = Vec::with_capacity(512);
+    let mut buffer = [0_u8; 512];
+    loop {
+        let read = socket
+            .read(&mut buffer)
+            .await
+            .map_err(|_| "failed to read websocket proxy CONNECT response".to_string())?;
+        if read == 0 {
+            return Err("websocket proxy closed during CONNECT".to_string());
+        }
+        response.extend_from_slice(&buffer[..read]);
+        if response.windows(4).any(|window| window == b"\r\n\r\n") {
+            break;
+        }
+        if response.len() > MAX_PROXY_RESPONSE_HEADERS {
+            return Err("websocket proxy CONNECT response headers were too large".to_string());
+        }
+    }
+    let status_line = response
+        .split(|byte| *byte == b'\n')
+        .next()
+        .and_then(|line| std::str::from_utf8(line).ok())
+        .unwrap_or_default()
+        .trim();
+    let status = status_line.split_whitespace().nth(1);
+    if status != Some("200") {
+        return Err(format!(
+            "websocket proxy CONNECT failed with status {}",
+            status.unwrap_or("unknown")
+        ));
+    }
+    Ok(socket)
+}
+
+fn format_authority(host: &str, port: u16) -> String {
+    if host.contains(':') {
+        format!("[{host}]:{port}")
+    } else {
+        format!("{host}:{port}")
+    }
+}
+
+fn proxy_authorization(proxy: &Url) -> Result<Option<String>, String> {
+    if proxy.username().is_empty() && proxy.password().is_none() {
+        return Ok(None);
+    }
+    let username = percent_decode_str(proxy.username())
+        .decode_utf8()
+        .map_err(|_| "websocket proxy username is not valid UTF-8".to_string())?;
+    let password = percent_decode_str(proxy.password().unwrap_or_default())
+        .decode_utf8()
+        .map_err(|_| "websocket proxy password is not valid UTF-8".to_string())?;
+    Ok(Some(
+        STANDARD.encode(format!("{username}:{password}").as_bytes()),
+    ))
 }
 
 enum WebSocketConnectError {
@@ -1874,6 +2123,10 @@ pub enum ProxyError {
     InvalidInstallationId,
     #[error("proxy body and concurrency limits must be positive")]
     InvalidLimit,
+    #[error("proxy upstream timeouts must be positive")]
+    InvalidTimeout,
+    #[error("WebSocket proxy must be an HTTP URL with a host")]
+    UnsupportedWebSocketProxy,
     #[error("upstream URL is not allowlisted")]
     UpstreamNotAllowed,
     #[error(transparent)]
@@ -1887,11 +2140,49 @@ mod tests {
     use super::{
         CachedWebSocketResponse, MAX_CACHED_WEBSOCKET_SESSIONS, RequestDiagnostics,
         WebSocketSession, WebSocketSessionPool, derive_installation_id, extract_sse_error_type,
-        normalize_upstream_error_status, prepare_websocket_request, sanitize_error_body,
+        normalize_upstream_error_status, prepare_websocket_request, proxy_authorization,
+        proxy_url_from_values, sanitize_error_body,
     };
     use http::{HeaderMap, StatusCode};
     use serde_json::json;
-    use std::time::Instant;
+    use std::{collections::HashMap, time::Instant};
+    use url::Url;
+
+    #[test]
+    fn websocket_proxy_environment_honors_precedence_and_no_proxy() {
+        let upstream =
+            Url::parse("wss://chatgpt.com/backend-api/codex/responses").expect("upstream URL");
+        let values = HashMap::from([
+            ("HTTPS_PROXY", "http://127.0.0.1:7890"),
+            ("ALL_PROXY", "http://127.0.0.1:9999"),
+        ]);
+        let selected =
+            proxy_url_from_values(&upstream, |name| values.get(name).map(ToString::to_string))
+                .expect("proxy selection")
+                .expect("selected proxy");
+        assert_eq!(selected.as_str(), "http://127.0.0.1:7890/");
+
+        let values = HashMap::from([
+            ("HTTPS_PROXY", "http://127.0.0.1:7890"),
+            ("NO_PROXY", ".chatgpt.com,localhost"),
+        ]);
+        assert!(
+            proxy_url_from_values(&upstream, |name| {
+                values.get(name).map(ToString::to_string)
+            })
+            .expect("proxy selection")
+            .is_none()
+        );
+    }
+
+    #[test]
+    fn websocket_proxy_basic_auth_decodes_url_credentials() {
+        let proxy = Url::parse("http://user%40name:p%3Ass@127.0.0.1:7890").expect("proxy URL");
+        assert_eq!(
+            proxy_authorization(&proxy).expect("proxy authorization"),
+            Some("dXNlckBuYW1lOnA6c3M=".to_string())
+        );
+    }
 
     #[test]
     fn upstream_diagnostic_redacts_sensitive_fields() {

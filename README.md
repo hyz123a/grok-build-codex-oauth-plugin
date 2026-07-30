@@ -33,6 +33,21 @@ grok-codex-oauth models sync
 grok-codex-oauth ensure-daemon
 ```
 
+If outbound access requires an HTTP CONNECT proxy, set the standard proxy environment before
+starting Grok or the daemon:
+
+```bash
+export HTTP_PROXY=http://127.0.0.1:7890
+export HTTPS_PROXY=http://127.0.0.1:7890
+export ALL_PROXY=http://127.0.0.1:7890
+export NO_PROXY=127.0.0.1,localhost
+```
+
+The HTTP/SSE and WebSocket transports both honor these settings. WebSocket uses `HTTPS_PROXY`
+first, then `ALL_PROXY`, and observes `NO_PROXY`. HTTP proxy URLs may include percent-encoded Basic
+Auth credentials. WebSocket connection setup is limited to 10 seconds and falls back to HTTP/SSE;
+waiting for HTTP/SSE response headers is limited to 30 seconds.
+
 Then install the local plugin directory:
 
 ```bash
@@ -122,6 +137,9 @@ grok-codex-oauth logs --request-id <request-id>
 The final `outcome` distinguishes `completed`, `sse_error`, `http_error`,
 `transport_error`, and `client_disconnected`. The daemon rotates the active log at 10 MiB and
 keeps `daemon.log.1` through `daemon.log.3`.
+
+Only models in the built-in or synchronized Codex catalog are accepted. A native Grok model such
+as `grok-4.5` is rejected locally instead of being forwarded with ChatGPT OAuth credentials.
 
 ## Test architecture
 

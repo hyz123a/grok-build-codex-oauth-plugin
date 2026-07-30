@@ -8,11 +8,13 @@ license.workspace = true
 async-trait.workspace = true
 async-stream.workspace = true
 axum.workspace = true
+base64.workspace = true
 bytes.workspace = true
 codex-oauth = { path = "../codex-oauth" }
 codex-protocol = { path = "../codex-protocol" }
 futures-util.workspace = true
 http.workspace = true
+percent-encoding.workspace = true
 reqwest.workspace = true
 serde.workspace = true
 serde_json.workspace = true

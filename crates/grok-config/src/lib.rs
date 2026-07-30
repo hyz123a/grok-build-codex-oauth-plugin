@@ -23,7 +23,7 @@ pub const MANAGED_MODEL_ALIASES: &[&str] = &[
     "codex-gpt-5-2",
 ];
 
-const CODEX_MODEL_CATALOG: &[(&str, &str, &str)] = &[
+pub const BUILTIN_CODEX_MODEL_CATALOG: &[(&str, &str, &str)] = &[
     ("codex-sol", "gpt-5.6-sol", "Codex GPT-5.6 Sol"),
     ("codex-terra", "gpt-5.6-terra", "Codex GPT-5.6 Terra"),
     ("codex-luna", "gpt-5.6-luna", "Codex GPT-5.6 Luna"),
@@ -133,7 +133,7 @@ pub fn install_model(path: &Path, config: &ModelConfig) -> Result<(), ConfigErro
 }
 
 pub fn install_model_catalog(path: &Path, config: &ModelConfig) -> Result<(), ConfigError> {
-    let catalog = CODEX_MODEL_CATALOG
+    let catalog = BUILTIN_CODEX_MODEL_CATALOG
         .iter()
         .map(|(alias, model, display_name)| SelectableModel {
             alias: (*alias).into(),

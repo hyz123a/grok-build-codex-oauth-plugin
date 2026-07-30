@@ -2,7 +2,7 @@ use std::sync::{
     Arc, Mutex as StdMutex,
     atomic::{AtomicUsize, Ordering},
 };
-use std::{io, io::Write};
+use std::{io, io::Write, time::Duration};
 
 use async_trait::async_trait;
 use axum::{
@@ -18,7 +18,10 @@ use codex_proxy::{CredentialProvider, ProxyConfig, build_router};
 use futures_util::{SinkExt, StreamExt};
 use http_body_util::BodyExt;
 use serde_json::{Value, json};
-use tokio::sync::Mutex;
+use tokio::{
+    io::{AsyncReadExt, AsyncWriteExt},
+    sync::Mutex,
+};
 use tokio_tungstenite::{
     accept_hdr_async,
     tungstenite::{
@@ -145,6 +148,41 @@ async fn proxy_requires_local_secret_and_forwards_transformed_sse() {
     assert_eq!(
         captures[0].1["include"],
         json!(["reasoning.encrypted_content"])
+    );
+}
+
+#[tokio::test]
+async fn health_reports_whether_websocket_proxying_is_active() {
+    let upstream_url = spawn_upstream(Captures::default()).await;
+    let config = ProxyConfig::for_test(upstream_url, "local-secret")
+        .with_websocket_proxy("http://127.0.0.1:7890")
+        .expect("valid websocket proxy");
+    let app = build_router(
+        config,
+        Arc::new(StubCredentials {
+            refreshes: Arc::new(AtomicUsize::new(0)),
+        }),
+    )
+    .expect("router");
+
+    let response = tower::ServiceExt::oneshot(
+        app,
+        axum::http::Request::get("/health")
+            .body(Body::empty())
+            .expect("request"),
+    )
+    .await
+    .expect("response");
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = response
+        .into_body()
+        .collect()
+        .await
+        .expect("health body")
+        .to_bytes();
+    assert_eq!(
+        serde_json::from_slice::<Value>(&body).expect("health JSON"),
+        json!({"status": "ok", "websocket_proxy": true})
     );
 }
 
@@ -561,6 +599,53 @@ async fn spawn_websocket_upstream(captures: WebSocketCaptures) -> String {
     format!("ws://{address}/responses")
 }
 
+async fn spawn_connect_proxy(
+    target: std::net::SocketAddr,
+    captured_request: Arc<Mutex<Option<String>>>,
+) -> String {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind CONNECT proxy");
+    let address = listener.local_addr().expect("CONNECT proxy addr");
+    tokio::spawn(async move {
+        let (mut downstream, _) = listener.accept().await.expect("accept CONNECT");
+        let mut request = Vec::new();
+        let mut buffer = [0_u8; 512];
+        while !request.windows(4).any(|window| window == b"\r\n\r\n") {
+            let read = downstream.read(&mut buffer).await.expect("read CONNECT");
+            if read == 0 {
+                return;
+            }
+            request.extend_from_slice(&buffer[..read]);
+        }
+        *captured_request.lock().await =
+            Some(String::from_utf8(request).expect("CONNECT request UTF-8"));
+        let mut upstream = tokio::net::TcpStream::connect(target)
+            .await
+            .expect("connect websocket target");
+        downstream
+            .write_all(b"HTTP/1.1 200 Connection Established\r\n\r\n")
+            .await
+            .expect("write CONNECT response");
+        tokio::io::copy_bidirectional(&mut downstream, &mut upstream)
+            .await
+            .expect("relay CONNECT tunnel");
+    });
+    format!("http://{address}")
+}
+
+async fn spawn_stalling_connect_proxy() -> String {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind stalling CONNECT proxy");
+    let address = listener.local_addr().expect("stalling proxy addr");
+    tokio::spawn(async move {
+        let (_stream, _) = listener.accept().await.expect("accept stalled CONNECT");
+        std::future::pending::<()>().await;
+    });
+    format!("http://{address}")
+}
+
 #[tokio::test]
 async fn websocket_is_preferred_and_bridged_to_downstream_sse() {
     let http_captures = Captures::default();
@@ -636,6 +721,128 @@ async fn websocket_is_preferred_and_bridged_to_downstream_sse() {
     assert_eq!(request["client_metadata"]["session_id"], "grok-session-42");
     assert_eq!(request["client_metadata"]["thread_id"], "grok-thread-42");
     assert_eq!(request["client_metadata"]["turn_id"], "request-ws-test");
+}
+
+#[tokio::test]
+async fn websocket_uses_an_http_connect_proxy() {
+    let http_captures = Captures::default();
+    let http_url = spawn_upstream(http_captures.clone()).await;
+    let websocket_captures = WebSocketCaptures::default();
+    let websocket_url = spawn_websocket_upstream(websocket_captures).await;
+    let websocket_address = websocket_url
+        .strip_prefix("ws://")
+        .and_then(|url| url.split('/').next())
+        .expect("websocket authority")
+        .parse()
+        .expect("websocket socket address");
+    let connect_request = Arc::new(Mutex::new(None));
+    let proxy_url = spawn_connect_proxy(websocket_address, connect_request.clone()).await;
+    let config = ProxyConfig::for_test(http_url, "local-secret")
+        .with_websocket_upstream(websocket_url)
+        .with_websocket_proxy(&proxy_url)
+        .expect("valid websocket proxy");
+    let app = build_router(
+        config,
+        Arc::new(StubCredentials {
+            refreshes: Arc::new(AtomicUsize::new(0)),
+        }),
+    )
+    .expect("router");
+
+    let response = tower::ServiceExt::oneshot(
+        app,
+        axum::http::Request::post("/v1/responses")
+            .header("authorization", "Bearer local-secret")
+            .header("content-type", "application/json")
+            .body(Body::from(r#"{"model":"gpt-test","input":[]}"#))
+            .expect("request"),
+    )
+    .await
+    .expect("response");
+
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        response.headers()["x-codex-upstream-transport"],
+        "websocket"
+    );
+    let _ = response.into_body().collect().await.expect("response body");
+    let connect_request = connect_request
+        .lock()
+        .await
+        .clone()
+        .expect("captured CONNECT request");
+    assert!(connect_request.starts_with(&format!("CONNECT {websocket_address} HTTP/1.1\r\n")));
+    assert!(http_captures.0.lock().await.is_empty());
+}
+
+#[tokio::test]
+async fn websocket_connect_timeout_falls_back_to_http_sse() {
+    let captures = Captures::default();
+    let http_url = spawn_upstream(captures.clone()).await;
+    let websocket_url = http_url.replacen("http://", "ws://", 1);
+    let proxy_url = spawn_stalling_connect_proxy().await;
+    let config = ProxyConfig::for_test(&http_url, "local-secret")
+        .with_websocket_upstream(websocket_url)
+        .with_websocket_proxy(proxy_url)
+        .expect("valid websocket proxy")
+        .with_upstream_timeouts(Duration::from_millis(50), Duration::from_secs(1));
+    let app = build_router(
+        config,
+        Arc::new(StubCredentials {
+            refreshes: Arc::new(AtomicUsize::new(0)),
+        }),
+    )
+    .expect("router");
+
+    let response = tower::ServiceExt::oneshot(
+        app,
+        axum::http::Request::post("/v1/responses")
+            .header("authorization", "Bearer local-secret")
+            .header("content-type", "application/json")
+            .body(Body::from(r#"{"model":"gpt-test","input":[]}"#))
+            .expect("request"),
+    )
+    .await
+    .expect("response");
+
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(response.headers()["x-codex-upstream-transport"], "http-sse");
+    assert_eq!(captures.0.lock().await.len(), 1);
+}
+
+#[tokio::test]
+async fn production_model_allowlist_rejects_non_codex_models() {
+    let captures = Captures::default();
+    let http_url = spawn_upstream(captures.clone()).await;
+    let config = ProxyConfig::for_test(http_url, "local-secret").with_allowed_models(["gpt-test"]);
+    let app = build_router(
+        config,
+        Arc::new(StubCredentials {
+            refreshes: Arc::new(AtomicUsize::new(0)),
+        }),
+    )
+    .expect("router");
+
+    let response = tower::ServiceExt::oneshot(
+        app,
+        axum::http::Request::post("/v1/responses")
+            .header("authorization", "Bearer local-secret")
+            .header("content-type", "application/json")
+            .body(Body::from(r#"{"model":"grok-4.5","input":[]}"#))
+            .expect("request"),
+    )
+    .await
+    .expect("response");
+
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    let body = response
+        .into_body()
+        .collect()
+        .await
+        .expect("error body")
+        .to_bytes();
+    assert!(String::from_utf8_lossy(&body).contains("unsupported Codex model `grok-4.5`"));
+    assert!(captures.0.lock().await.is_empty());
 }
 
 #[tokio::test]
