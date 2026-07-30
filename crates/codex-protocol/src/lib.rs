@@ -15,6 +15,14 @@ use thiserror::Error;
 
 pub const DEFAULT_ORIGINATOR: &str = "grok-build";
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct UpstreamRequestIds {
+    pub installation_id: String,
+    pub session_id: String,
+    pub thread_id: String,
+    pub prompt_cache_key: Option<String>,
+}
+
 /// Stateful, incremental bridge between the Codex backend's output-item SSE
 /// stream and Grok's expectation that terminal responses contain `output`.
 #[derive(Debug, Default)]
@@ -408,7 +416,7 @@ pub fn build_upstream_headers(
     incoming: &HeaderMap,
     access_token: &str,
     account_id: &str,
-    prompt_cache_key: Option<&str>,
+    ids: &UpstreamRequestIds,
 ) -> Result<HeaderMap, ProtocolError> {
     let mut headers = HeaderMap::new();
 
@@ -436,11 +444,11 @@ pub fn build_upstream_headers(
     headers.insert("originator", HeaderValue::from_static(DEFAULT_ORIGINATOR));
     headers.insert(ACCEPT, HeaderValue::from_static("text/event-stream"));
     headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
-    if let Some(prompt_cache_key) = prompt_cache_key.filter(|key| !key.is_empty()) {
-        let session = HeaderValue::from_str(prompt_cache_key)
-            .map_err(|_| ProtocolError::InvalidHeader("prompt_cache_key"))?;
-        headers.insert("session-id", session.clone());
-        headers.insert("thread-id", session);
-    }
+    let session = HeaderValue::from_str(&ids.session_id)
+        .map_err(|_| ProtocolError::InvalidHeader("session-id"))?;
+    let thread = HeaderValue::from_str(&ids.thread_id)
+        .map_err(|_| ProtocolError::InvalidHeader("thread-id"))?;
+    headers.insert("session-id", session);
+    headers.insert("thread-id", thread);
     Ok(headers)
 }

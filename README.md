@@ -86,16 +86,29 @@ represent it.
 
 ## Proxy diagnostics
 
+The daemon prefers the Codex Responses WebSocket v2 transport and automatically falls back to
+HTTP/SSE when the WebSocket handshake or initial send is unavailable. Grok still receives an SSE
+response, so no Grok-side protocol change is required. Requests from the same Grok session reuse
+one serialized WebSocket connection. When the complete next input is a safe extension of the
+previous turn and all other request properties are unchanged, the proxy sends only the input delta
+with `previous_response_id`; otherwise it conservatively sends the full request. Codex turn state
+is retained for tool continuations and reset when a new user turn begins. Closed connections,
+initial send failures, authorization expiry, and missing previous responses are reconnected or
+retried automatically before falling back to HTTP/SSE.
+
 The daemon writes timestamped request metadata to `~/.grok/codex-oauth/daemon.log`. Each valid
-proxy request records the model and client request ID, upstream status and request ID,
-response-header latency, first-SSE-byte latency, SSE error type, and final outcome and duration.
-Stream error messages, prompts, OAuth tokens, and response content are not included.
+proxy request records the selected upstream transport, model and client request ID, upstream status
+and request ID, connection-reuse and incremental-request decisions, response-header or
+WebSocket-event latency, stream error type, and final outcome and duration. Stream error messages,
+prompts, OAuth tokens, and response content are not included.
 If Grok omits `x-request-id`, the proxy generates a `proxy-<pid>-<sequence>` correlation ID.
 Cache diagnostics record only whether `prompt_cache_key` is present, a short SHA-256 fingerprint,
 input and cached-input token counts, and the cache-hit percentage; the raw cache key is never logged.
 When Grok omits `prompt_cache_key`, the proxy derives it from Grok's stable `x-grok-session-id`
-and sends the same value through the native Codex `session-id` and `thread-id` headers. An explicit
-request-body cache key always takes precedence.
+and uses that Grok value as the Codex `session-id`. `thread-id` uses `x-grok-thread-id` when
+available and otherwise falls back to the Grok session. A separate stable installation identifier
+is sent only through WebSocket client metadata. An explicit request-body cache key always takes
+precedence without changing either identity header.
 
 ```bash
 grok-codex-oauth logs

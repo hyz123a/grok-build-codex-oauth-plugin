@@ -20,19 +20,29 @@ use axum::{
 };
 use codex_oauth::{AccessCredential, CredentialStore, Credentials, OAuthClient};
 use codex_protocol::{
-    CodexSseTransformer, TransformOptions, build_upstream_headers, transform_responses_request,
+    CodexSseTransformer, TransformOptions, UpstreamRequestIds, build_upstream_headers,
+    transform_responses_request,
 };
-use futures_util::StreamExt;
+use futures_util::{SinkExt, StreamExt};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use thiserror::Error;
-use tokio::sync::{Mutex, Semaphore};
+use tokio::{
+    net::TcpStream,
+    sync::{Mutex, OwnedMutexGuard, Semaphore},
+};
+use tokio_tungstenite::{
+    MaybeTlsStream, WebSocketStream, connect_async,
+    tungstenite::{Message, client::IntoClientRequest},
+};
 use url::Url;
 
 pub const CODEX_RESPONSES_URL: &str = "https://chatgpt.com/backend-api/codex/responses";
 const DEFAULT_BODY_LIMIT: usize = 16 * 1024 * 1024;
 const DEFAULT_MAX_CONCURRENCY: usize = 4;
+const MAX_CACHED_WEBSOCKET_SESSIONS: usize = 64;
 static REQUEST_SEQUENCE: AtomicU64 = AtomicU64::new(1);
+type CodexWebSocket = WebSocketStream<MaybeTlsStream<TcpStream>>;
 
 #[async_trait]
 pub trait CredentialProvider: Send + Sync {
@@ -105,6 +115,8 @@ impl CredentialProvider for StoredCredentialProvider {
 #[derive(Clone, Debug)]
 pub struct ProxyConfig {
     upstream_url: Url,
+    websocket_url: Option<Url>,
+    installation_id: String,
     local_secret: String,
     body_limit: usize,
     max_concurrency: usize,
@@ -114,9 +126,13 @@ pub struct ProxyConfig {
 
 impl ProxyConfig {
     pub fn production(local_secret: impl Into<String>) -> Result<Self, ProxyError> {
+        let local_secret = local_secret.into();
+        let upstream_url = Url::parse(CODEX_RESPONSES_URL)?;
         Ok(Self {
-            upstream_url: Url::parse(CODEX_RESPONSES_URL)?,
-            local_secret: local_secret.into(),
+            websocket_url: Some(websocket_url(&upstream_url)),
+            upstream_url,
+            installation_id: derive_installation_id(&local_secret),
+            local_secret,
             body_limit: DEFAULT_BODY_LIMIT,
             max_concurrency: DEFAULT_MAX_CONCURRENCY,
             reasoning_options: HashMap::new(),
@@ -125,12 +141,15 @@ impl ProxyConfig {
     }
 
     pub fn for_test(upstream_url: impl AsRef<str>, local_secret: impl Into<String>) -> Self {
+        let local_secret = local_secret.into();
         let upstream_url = Url::parse(upstream_url.as_ref()).unwrap_or_else(|_| {
             Url::parse("http://127.0.0.1/invalid").expect("static loopback fallback URL must parse")
         });
         Self {
             upstream_url,
-            local_secret: local_secret.into(),
+            websocket_url: None,
+            installation_id: derive_installation_id(&local_secret),
+            local_secret,
             body_limit: DEFAULT_BODY_LIMIT,
             max_concurrency: DEFAULT_MAX_CONCURRENCY,
             reasoning_options: HashMap::new(),
@@ -141,6 +160,16 @@ impl ProxyConfig {
     pub fn with_limits(mut self, body_limit: usize, max_concurrency: usize) -> Self {
         self.body_limit = body_limit;
         self.max_concurrency = max_concurrency;
+        self
+    }
+
+    pub fn with_installation_id(mut self, installation_id: impl Into<String>) -> Self {
+        self.installation_id = installation_id.into();
+        self
+    }
+
+    pub fn with_websocket_upstream(mut self, upstream_url: impl AsRef<str>) -> Self {
+        self.websocket_url = Url::parse(upstream_url.as_ref()).ok();
         self
     }
 
@@ -179,24 +208,52 @@ impl ProxyConfig {
         if self.local_secret.is_empty() {
             return Err(ProxyError::EmptyLocalSecret);
         }
+        if self.installation_id.is_empty() {
+            return Err(ProxyError::InvalidInstallationId);
+        }
         if self.body_limit == 0 || self.max_concurrency == 0 {
             return Err(ProxyError::InvalidLimit);
         }
         if !self.allow_test_upstream && self.upstream_url.as_str() != CODEX_RESPONSES_URL {
             return Err(ProxyError::UpstreamNotAllowed);
         }
-        if self.allow_test_upstream {
-            let loopback = self
-                .upstream_url
-                .host_str()
-                .and_then(|host| host.parse::<std::net::IpAddr>().ok())
-                .is_some_and(|address| address.is_loopback());
-            if !loopback {
-                return Err(ProxyError::UpstreamNotAllowed);
-            }
+        if self.allow_test_upstream
+            && (!is_loopback_url(&self.upstream_url)
+                || self
+                    .websocket_url
+                    .as_ref()
+                    .is_some_and(|url| !is_loopback_url(url)))
+        {
+            return Err(ProxyError::UpstreamNotAllowed);
         }
         Ok(())
     }
+}
+
+fn websocket_url(upstream_url: &Url) -> Url {
+    let mut websocket_url = upstream_url.clone();
+    let scheme = match upstream_url.scheme() {
+        "http" => "ws",
+        "https" => "wss",
+        _ => return websocket_url,
+    };
+    let _ = websocket_url.set_scheme(scheme);
+    websocket_url
+}
+
+fn is_loopback_url(url: &Url) -> bool {
+    url.host_str()
+        .and_then(|host| host.parse::<std::net::IpAddr>().ok())
+        .is_some_and(|address| address.is_loopback())
+}
+
+fn derive_installation_id(local_secret: &str) -> String {
+    let digest = Sha256::digest(format!("grok-codex-oauth-installation:{local_secret}").as_bytes());
+    let fingerprint = digest[..16]
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<String>();
+    format!("grok-installation-{fingerprint}")
 }
 
 #[derive(Clone)]
@@ -205,6 +262,46 @@ struct AppState {
     credentials: Arc<dyn CredentialProvider>,
     client: reqwest::Client,
     concurrency: Arc<Semaphore>,
+    websocket_sessions: Arc<WebSocketSessionPool>,
+}
+
+#[derive(Default)]
+struct WebSocketSessionPool {
+    sessions: Mutex<HashMap<String, Arc<Mutex<WebSocketSession>>>>,
+}
+
+#[derive(Default)]
+struct WebSocketSession {
+    connection: Option<CodexWebSocket>,
+    last_request: Option<Value>,
+    last_response: Option<CachedWebSocketResponse>,
+    turn_state: Option<String>,
+}
+
+#[derive(Clone)]
+struct CachedWebSocketResponse {
+    response_id: String,
+    output: Vec<Value>,
+}
+
+impl WebSocketSessionPool {
+    async fn get(&self, key: String) -> Arc<Mutex<WebSocketSession>> {
+        let mut sessions = self.sessions.lock().await;
+        if let Some(session) = sessions.get(&key) {
+            return Arc::clone(session);
+        }
+        if sessions.len() >= MAX_CACHED_WEBSOCKET_SESSIONS
+            && let Some(eviction_key) = sessions
+                .iter()
+                .find(|(_, session)| Arc::strong_count(session) == 1)
+                .map(|(key, _)| key.clone())
+        {
+            sessions.remove(&eviction_key);
+        }
+        let session = Arc::new(Mutex::new(WebSocketSession::default()));
+        sessions.insert(key, Arc::clone(&session));
+        session
+    }
 }
 
 pub fn build_router(
@@ -222,6 +319,7 @@ pub fn build_router(
             .build()
             .map_err(ProxyError::HttpClient)?,
         concurrency: Arc::new(Semaphore::new(concurrency)),
+        websocket_sessions: Arc::new(WebSocketSessionPool::default()),
     };
     Ok(Router::new()
         .route("/health", get(health))
@@ -263,8 +361,9 @@ async fn proxy_responses(
         Ok(transformed) => transformed,
         Err(error) => return error_response(StatusCode::BAD_REQUEST, &error.to_string()),
     };
-    let prompt_cache_key = resolve_prompt_cache_key(&mut transformed, &headers);
-    let diagnostics = RequestDiagnostics::new(request_started_at, &headers, &transformed);
+    let ids =
+        resolve_upstream_request_ids(&mut transformed, &headers, &state.config.installation_id);
+    let diagnostics = RequestDiagnostics::new(request_started_at, &headers, &transformed, &ids);
     diagnostics.log_received();
     let encoded = match serde_json::to_vec(&transformed) {
         Ok(encoded) => encoded,
@@ -280,13 +379,38 @@ async fn proxy_responses(
         Err(message) => return error_response(StatusCode::UNAUTHORIZED, &message),
     };
 
+    if state.config.websocket_url.is_some() {
+        match send_websocket_upstream(
+            &state,
+            &headers,
+            &transformed,
+            &credential,
+            &diagnostics.client_request_id,
+            &ids,
+            diagnostics.clone(),
+        )
+        .await
+        {
+            Ok(response) => return response,
+            Err(reason) => {
+                tracing::warn!(
+                    client_request_id = diagnostics.client_request_id.as_str(),
+                    model = diagnostics.model.as_str(),
+                    reason,
+                    fallback_transport = "http-sse",
+                    "Codex upstream WebSocket unavailable; falling back"
+                );
+            }
+        }
+    }
+
     let first = match send_upstream(
         &state,
         &headers,
         &encoded,
         &credential,
         &diagnostics.client_request_id,
-        prompt_cache_key.as_deref(),
+        &ids,
     )
     .await
     {
@@ -309,7 +433,7 @@ async fn proxy_responses(
             &encoded,
             &refreshed,
             &diagnostics.client_request_id,
-            prompt_cache_key.as_deref(),
+            &ids,
         )
         .await
         {
@@ -349,24 +473,44 @@ fn constant_time_equal(left: &[u8], right: &[u8]) -> bool {
         == 0
 }
 
-fn resolve_prompt_cache_key(request: &mut Value, headers: &HeaderMap) -> Option<String> {
-    if let Some(key) = request
+fn resolve_upstream_request_ids(
+    request: &mut Value,
+    headers: &HeaderMap,
+    installation_id: &str,
+) -> UpstreamRequestIds {
+    let grok_session_id = headers
+        .get("x-grok-session-id")
+        .and_then(|value| value.to_str().ok())
+        .filter(|key| !key.is_empty())
+        .unwrap_or(installation_id)
+        .to_owned();
+    let grok_thread_id = headers
+        .get("x-grok-thread-id")
+        .and_then(|value| value.to_str().ok())
+        .filter(|key| !key.is_empty())
+        .unwrap_or(&grok_session_id)
+        .to_owned();
+    let prompt_cache_key = if let Some(key) = request
         .get("prompt_cache_key")
         .and_then(Value::as_str)
         .filter(|key| !key.is_empty())
     {
-        return Some(key.to_owned());
+        Some(key.to_owned())
+    } else {
+        request.as_object_mut().map(|object| {
+            object.insert(
+                "prompt_cache_key".to_owned(),
+                Value::String(grok_session_id.clone()),
+            );
+            grok_session_id.clone()
+        })
+    };
+    UpstreamRequestIds {
+        installation_id: installation_id.to_owned(),
+        session_id: grok_session_id,
+        thread_id: grok_thread_id,
+        prompt_cache_key,
     }
-
-    let key = headers
-        .get("x-grok-session-id")
-        .and_then(|value| value.to_str().ok())
-        .filter(|key| !key.is_empty())?
-        .to_owned();
-    request
-        .as_object_mut()?
-        .insert("prompt_cache_key".to_owned(), Value::String(key.clone()));
-    Some(key)
 }
 
 async fn send_upstream(
@@ -375,13 +519,13 @@ async fn send_upstream(
     body: &[u8],
     credential: &AccessCredential,
     request_id: &str,
-    prompt_cache_key: Option<&str>,
+    ids: &UpstreamRequestIds,
 ) -> Result<reqwest::Response, String> {
     let mut headers = build_upstream_headers(
         incoming_headers,
         &credential.access_token,
         &credential.account_id,
-        prompt_cache_key,
+        ids,
     )
     .map_err(|error| error.to_string())?;
     if !headers.contains_key("x-request-id") {
@@ -397,6 +541,675 @@ async fn send_upstream(
         .send()
         .await
         .map_err(|_| "Codex upstream request failed".to_string())
+}
+
+async fn send_websocket_upstream(
+    state: &AppState,
+    incoming_headers: &HeaderMap,
+    request: &Value,
+    credential: &AccessCredential,
+    request_id: &str,
+    ids: &UpstreamRequestIds,
+    diagnostics: RequestDiagnostics,
+) -> Result<Response, String> {
+    let session_key = websocket_session_key(&credential.account_id, ids);
+    let session = state.websocket_sessions.get(session_key).await;
+    let mut session = session.lock_owned().await;
+    if session.connection.is_some() && !cached_websocket_is_usable(&mut session).await {
+        reset_websocket_session(&mut session);
+    }
+    let mut prepared = prepare_websocket_request(request, &session);
+    if prepared.starts_new_turn {
+        session.turn_state = None;
+    }
+    let mut connection_reused = session.connection.is_some();
+    let mut payload = websocket_request_payload(
+        &prepared.payload,
+        ids,
+        request_id,
+        session.turn_state.as_deref(),
+    )?;
+    let full_retry_payload = websocket_request_payload(
+        &PreparedWebSocketRequest::full(request).payload,
+        ids,
+        request_id,
+        session.turn_state.as_deref(),
+    )?;
+
+    if session.connection.is_none() {
+        let (connection, handshake_turn_state) = connect_websocket_with_refresh(
+            state,
+            incoming_headers,
+            credential,
+            request_id,
+            ids,
+            &diagnostics,
+        )
+        .await?;
+        session.connection = Some(connection);
+        if session.turn_state.is_none() {
+            session.turn_state = handshake_turn_state;
+        }
+    }
+
+    let send_result = session
+        .connection
+        .as_mut()
+        .ok_or_else(|| "websocket connection is unavailable".to_string())?
+        .send(Message::Text(payload.clone().into()))
+        .await;
+    if send_result.is_err() {
+        reset_websocket_session(&mut session);
+        connection_reused = false;
+        prepared = PreparedWebSocketRequest::full(request);
+        payload = websocket_request_payload(&prepared.payload, ids, request_id, None)?;
+        let (connection, handshake_turn_state) = connect_websocket_with_refresh(
+            state,
+            incoming_headers,
+            credential,
+            request_id,
+            ids,
+            &diagnostics,
+        )
+        .await?;
+        session.connection = Some(connection);
+        session.turn_state = handshake_turn_state;
+        session
+            .connection
+            .as_mut()
+            .ok_or_else(|| "websocket connection is unavailable".to_string())?
+            .send(Message::Text(payload.into()))
+            .await
+            .map_err(|_| "failed to send Codex websocket request after reconnect".to_string())?;
+    }
+
+    session.last_request = Some(request.clone());
+    session.last_response = None;
+    tracing::info!(
+        client_request_id = diagnostics.client_request_id.as_str(),
+        model = diagnostics.model.as_str(),
+        transport = "websocket",
+        connection_reused,
+        incremental_request = prepared.incremental,
+        previous_response_id_present = prepared.incremental,
+        "Codex upstream WebSocket request sent"
+    );
+
+    let stream = bridge_websocket_stream(
+        WebSocketLease::new(session),
+        diagnostics,
+        WebSocketRequestMode {
+            connection_reused,
+            incremental: prepared.incremental,
+        },
+        full_retry_payload,
+    );
+    let mut response = Response::new(Body::from_stream(stream));
+    *response.status_mut() = StatusCode::OK;
+    response
+        .headers_mut()
+        .insert(CONTENT_TYPE, HeaderValue::from_static("text/event-stream"));
+    response.headers_mut().insert(
+        "x-codex-upstream-transport",
+        HeaderValue::from_static("websocket"),
+    );
+    Ok(response)
+}
+
+async fn connect_websocket_with_refresh(
+    state: &AppState,
+    incoming_headers: &HeaderMap,
+    credential: &AccessCredential,
+    request_id: &str,
+    ids: &UpstreamRequestIds,
+    diagnostics: &RequestDiagnostics,
+) -> Result<(CodexWebSocket, Option<String>), String> {
+    match connect_websocket_upstream(
+        state,
+        incoming_headers,
+        credential,
+        request_id,
+        ids,
+        diagnostics,
+    )
+    .await
+    {
+        Ok(connection) => Ok(connection),
+        Err(WebSocketConnectError::Unauthorized) => {
+            let refreshed = state.credentials.force_refresh().await?;
+            connect_websocket_upstream(
+                state,
+                incoming_headers,
+                &refreshed,
+                request_id,
+                ids,
+                diagnostics,
+            )
+            .await
+            .map_err(WebSocketConnectError::into_message)
+        }
+        Err(error) => Err(error.into_message()),
+    }
+}
+
+async fn cached_websocket_is_usable(session: &mut WebSocketSession) -> bool {
+    let Some(websocket) = session.connection.as_mut() else {
+        return false;
+    };
+    // Codex can enqueue private timing/metadata events immediately after the public terminal
+    // response. Drain only those known internal events before deciding whether the cached
+    // connection is still reusable; an unknown data frame remains a protocol-state mismatch.
+    for _ in 0..16 {
+        match tokio::time::timeout(Duration::from_millis(1), websocket.next()).await {
+            Err(_) => return true,
+            Ok(Some(Ok(Message::Ping(payload)))) => {
+                if websocket.send(Message::Pong(payload)).await.is_err() {
+                    return false;
+                }
+            }
+            Ok(Some(Ok(Message::Pong(_)))) => {}
+            Ok(Some(Ok(Message::Text(text)))) if is_internal_websocket_event(text.as_str()) => {
+                if let Some(turn_state) = websocket_event_turn_state(text.as_str()) {
+                    session.turn_state = Some(turn_state);
+                }
+            }
+            Ok(Some(Ok(
+                Message::Close(_) | Message::Text(_) | Message::Binary(_) | Message::Frame(_),
+            )))
+            | Ok(Some(Err(_)))
+            | Ok(None) => return false,
+        }
+    }
+    true
+}
+
+fn reset_websocket_session(session: &mut WebSocketSession) {
+    session.connection = None;
+    session.last_request = None;
+    session.last_response = None;
+    session.turn_state = None;
+}
+
+async fn connect_websocket_upstream(
+    state: &AppState,
+    incoming_headers: &HeaderMap,
+    credential: &AccessCredential,
+    request_id: &str,
+    ids: &UpstreamRequestIds,
+    diagnostics: &RequestDiagnostics,
+) -> Result<(CodexWebSocket, Option<String>), WebSocketConnectError> {
+    let websocket_url = state.config.websocket_url.as_ref().ok_or_else(|| {
+        WebSocketConnectError::Other("websocket upstream is disabled".to_string())
+    })?;
+    let mut headers = build_upstream_headers(
+        incoming_headers,
+        &credential.access_token,
+        &credential.account_id,
+        ids,
+    )
+    .map_err(|error| WebSocketConnectError::Other(error.to_string()))?;
+    headers.remove("accept");
+    headers.remove("content-type");
+    headers.insert(
+        "openai-beta",
+        HeaderValue::from_static("responses_websockets=2026-02-06"),
+    );
+    let thread_id = HeaderValue::from_str(&ids.thread_id)
+        .map_err(|_| WebSocketConnectError::Other("invalid websocket thread ID".to_string()))?;
+    headers.insert("x-client-request-id", thread_id);
+    let window_id = HeaderValue::from_str(&ids.session_id)
+        .map_err(|_| WebSocketConnectError::Other("invalid websocket session ID".to_string()))?;
+    headers.insert("x-codex-window-id", window_id);
+    if !headers.contains_key("x-request-id") {
+        let request_id = HeaderValue::from_str(request_id)
+            .map_err(|_| WebSocketConnectError::Other("invalid proxy request ID".to_string()))?;
+        headers.insert("x-request-id", request_id);
+    }
+
+    let mut websocket_request = websocket_url.as_str().into_client_request().map_err(|_| {
+        WebSocketConnectError::Other("failed to build Codex websocket request".to_string())
+    })?;
+    websocket_request.headers_mut().extend(headers);
+    let (websocket, response) = connect_async(websocket_request).await.map_err(|error| {
+        if matches!(
+            &error,
+            tokio_tungstenite::tungstenite::Error::Http(response)
+                if response.status() == StatusCode::UNAUTHORIZED
+        ) {
+            WebSocketConnectError::Unauthorized
+        } else {
+            WebSocketConnectError::Other(format!(
+                "websocket handshake failed: {}",
+                websocket_error_kind(&error)
+            ))
+        }
+    })?;
+    tracing::info!(
+        client_request_id = diagnostics.client_request_id.as_str(),
+        model = diagnostics.model.as_str(),
+        upstream_status = response.status().as_u16(),
+        transport = "websocket",
+        "Codex upstream WebSocket connected"
+    );
+    let turn_state = response
+        .headers()
+        .get("x-codex-turn-state")
+        .and_then(|value| value.to_str().ok())
+        .map(str::to_owned);
+    Ok((websocket, turn_state))
+}
+
+enum WebSocketConnectError {
+    Unauthorized,
+    Other(String),
+}
+
+impl WebSocketConnectError {
+    fn into_message(self) -> String {
+        match self {
+            Self::Unauthorized => "websocket handshake unauthorized".to_string(),
+            Self::Other(message) => message,
+        }
+    }
+}
+
+fn websocket_request_payload(
+    request: &Value,
+    ids: &UpstreamRequestIds,
+    request_id: &str,
+    turn_state: Option<&str>,
+) -> Result<String, String> {
+    let mut request = request.clone();
+    let object = request
+        .as_object_mut()
+        .ok_or_else(|| "Codex websocket request must be a JSON object".to_string())?;
+    object.insert("type".into(), Value::String("response.create".into()));
+    let client_metadata = object
+        .entry("client_metadata")
+        .or_insert_with(|| Value::Object(serde_json::Map::new()));
+    if !client_metadata.is_object() {
+        *client_metadata = Value::Object(serde_json::Map::new());
+    }
+    let metadata = client_metadata
+        .as_object_mut()
+        .ok_or_else(|| "failed to build websocket client metadata".to_string())?;
+    metadata.insert("session_id".into(), Value::String(ids.session_id.clone()));
+    metadata.insert("thread_id".into(), Value::String(ids.thread_id.clone()));
+    metadata.insert(
+        "x-codex-installation-id".into(),
+        Value::String(ids.installation_id.clone()),
+    );
+    metadata.insert(
+        "x-codex-window-id".into(),
+        Value::String(ids.session_id.clone()),
+    );
+    metadata.insert("turn_id".into(), Value::String(request_id.to_owned()));
+    metadata.insert(
+        "x-codex-ws-stream-request-start-ms".into(),
+        Value::String(unix_timestamp_ms().to_string()),
+    );
+    metadata.remove("x-codex-turn-state");
+    if let Some(turn_state) = turn_state {
+        metadata.insert(
+            "x-codex-turn-state".into(),
+            Value::String(turn_state.to_owned()),
+        );
+    }
+    serde_json::to_string(&request)
+        .map_err(|_| "failed to encode Codex websocket request".to_string())
+}
+
+fn unix_timestamp_ms() -> u128 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis()
+}
+
+fn websocket_session_key(account_id: &str, ids: &UpstreamRequestIds) -> String {
+    let mut digest = Sha256::new();
+    digest.update(account_id.as_bytes());
+    digest.update([0]);
+    digest.update(ids.session_id.as_bytes());
+    digest.update([0]);
+    digest.update(ids.thread_id.as_bytes());
+    digest
+        .finalize()
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
+}
+
+struct PreparedWebSocketRequest {
+    payload: Value,
+    incremental: bool,
+    starts_new_turn: bool,
+}
+
+impl PreparedWebSocketRequest {
+    fn full(request: &Value) -> Self {
+        let mut payload = request.clone();
+        if let Some(object) = payload.as_object_mut() {
+            object.remove("previous_response_id");
+        }
+        Self {
+            payload,
+            incremental: false,
+            starts_new_turn: request_input(request)
+                .is_some_and(|input| input.iter().any(is_user_message)),
+        }
+    }
+}
+
+fn prepare_websocket_request(
+    request: &Value,
+    session: &WebSocketSession,
+) -> PreparedWebSocketRequest {
+    let Some(previous_request) = session.last_request.as_ref() else {
+        return PreparedWebSocketRequest::full(request);
+    };
+    let Some(previous_response) = session.last_response.as_ref() else {
+        return PreparedWebSocketRequest::full(request);
+    };
+    if !websocket_request_properties_match(previous_request, request) {
+        return PreparedWebSocketRequest::full(request);
+    }
+    let Some(previous_input) = request_input(previous_request) else {
+        return PreparedWebSocketRequest::full(request);
+    };
+    let Some(current_input) = request_input(request) else {
+        return PreparedWebSocketRequest::full(request);
+    };
+    let baseline = previous_input
+        .iter()
+        .chain(previous_response.output.iter())
+        .collect::<Vec<_>>();
+    if current_input.len() < baseline.len()
+        || !baseline
+            .iter()
+            .zip(current_input)
+            .all(|(previous, current)| *previous == current)
+    {
+        return PreparedWebSocketRequest::full(request);
+    }
+    let delta = current_input[baseline.len()..].to_vec();
+    let mut payload = request.clone();
+    let Some(object) = payload.as_object_mut() else {
+        return PreparedWebSocketRequest::full(request);
+    };
+    object.insert("input".into(), Value::Array(delta.clone()));
+    object.insert(
+        "previous_response_id".into(),
+        Value::String(previous_response.response_id.clone()),
+    );
+    PreparedWebSocketRequest {
+        payload,
+        incremental: true,
+        starts_new_turn: delta.iter().any(is_user_message),
+    }
+}
+
+fn websocket_request_properties_match(previous: &Value, current: &Value) -> bool {
+    fn properties(request: &Value) -> Option<serde_json::Map<String, Value>> {
+        let mut properties = request.as_object()?.clone();
+        for field in [
+            "input",
+            "client_metadata",
+            "previous_response_id",
+            "stream_options",
+            "type",
+        ] {
+            properties.remove(field);
+        }
+        Some(properties)
+    }
+    properties(previous) == properties(current)
+}
+
+fn request_input(request: &Value) -> Option<&[Value]> {
+    request.get("input")?.as_array().map(Vec::as_slice)
+}
+
+fn is_user_message(item: &Value) -> bool {
+    item.get("type").and_then(Value::as_str) == Some("message")
+        && item.get("role").and_then(Value::as_str) == Some("user")
+}
+
+fn websocket_error_kind(error: &tokio_tungstenite::tungstenite::Error) -> &'static str {
+    use tokio_tungstenite::tungstenite::Error;
+    match error {
+        Error::Http(_) => "http_upgrade_rejected",
+        Error::Io(_) => "network_error",
+        Error::Tls(_) => "tls_error",
+        Error::ConnectionClosed | Error::AlreadyClosed => "connection_closed",
+        Error::Protocol(_) => "protocol_error",
+        _ => "websocket_error",
+    }
+}
+
+struct WebSocketLease {
+    session: OwnedMutexGuard<WebSocketSession>,
+    finished: bool,
+}
+
+impl WebSocketLease {
+    fn new(session: OwnedMutexGuard<WebSocketSession>) -> Self {
+        Self {
+            session,
+            finished: false,
+        }
+    }
+
+    fn mark_finished(&mut self) {
+        self.finished = true;
+    }
+}
+
+impl Drop for WebSocketLease {
+    fn drop(&mut self) {
+        if !self.finished {
+            self.session.connection = None;
+            self.session.last_request = None;
+            self.session.last_response = None;
+            self.session.turn_state = None;
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+struct WebSocketRequestMode {
+    connection_reused: bool,
+    incremental: bool,
+}
+
+fn bridge_websocket_stream(
+    mut lease: WebSocketLease,
+    diagnostics: RequestDiagnostics,
+    mode: WebSocketRequestMode,
+    full_retry_payload: String,
+) -> impl futures_util::Stream<Item = Result<Bytes, std::io::Error>> {
+    async_stream::stream! {
+        let mut transformer = CodexSseTransformer::default();
+        let mut stream_diagnostics =
+            WebSocketStreamDiagnostics::new(diagnostics, mode);
+        let mut previous_response_retry_used = false;
+        let outcome;
+        loop {
+            let message = match lease.session.connection.as_mut() {
+                Some(websocket) => websocket.next().await,
+                None => None,
+            };
+            let Some(message) = message else {
+                stream_diagnostics.finish("transport_error");
+                yield Err(std::io::Error::other(
+                    "Codex websocket closed before a terminal response",
+                ));
+                return;
+            };
+            let message = match message {
+                Ok(message) => message,
+                Err(_) => {
+                    tracing::warn!(
+                        client_request_id = stream_diagnostics.request.client_request_id.as_str(),
+                        model = stream_diagnostics.request.model.as_str(),
+                        "Codex upstream WebSocket transport failed"
+                    );
+                    stream_diagnostics.finish("transport_error");
+                    yield Err(std::io::Error::other("Codex websocket transport failed"));
+                    return;
+                }
+            };
+            match message {
+                Message::Text(text) => {
+                    let text = text.as_str();
+                    if let Some(turn_state) = websocket_event_turn_state(text) {
+                        lease.session.turn_state = Some(turn_state);
+                    }
+                    if is_internal_websocket_event(text) {
+                        continue;
+                    }
+                    if mode.incremental
+                        && !previous_response_retry_used
+                        && !stream_diagnostics.first_event_logged
+                        && websocket_previous_response_not_found(text)
+                    {
+                        previous_response_retry_used = true;
+                        lease.session.last_response = None;
+                        let send_result = match lease.session.connection.as_mut() {
+                            Some(websocket) => websocket
+                                .send(Message::Text(full_retry_payload.clone().into()))
+                                .await,
+                            None => return,
+                        };
+                        if send_result.is_err() {
+                            stream_diagnostics.finish("transport_error");
+                            yield Err(std::io::Error::other(
+                                "failed to retry full websocket request",
+                            ));
+                            return;
+                        }
+                        tracing::warn!(
+                            client_request_id =
+                                stream_diagnostics.request.client_request_id.as_str(),
+                            model = stream_diagnostics.request.model.as_str(),
+                            retry_reason = "previous_response_not_found",
+                            "Codex WebSocket incremental request retried with full input"
+                        );
+                        continue;
+                    }
+                    let framed = format!("data: {text}\n\n");
+                    stream_diagnostics.observe_event(framed.as_bytes());
+                    let terminal = websocket_event_is_terminal(text);
+                    if let Some(response) = completed_websocket_response(text) {
+                        lease.session.last_response = Some(response);
+                    }
+                    for event in transformer.push(framed.as_bytes()) {
+                        yield Ok(Bytes::from(event));
+                    }
+                    stream_diagnostics.observe_filtered_keepalives(
+                        transformer.take_filtered_keepalive_events(),
+                    );
+                    if terminal {
+                        outcome = if stream_diagnostics.sse_error_type.is_some() {
+                            "sse_error"
+                        } else {
+                            "completed"
+                        };
+                        if outcome == "sse_error" {
+                            lease.session.connection = None;
+                            lease.session.last_request = None;
+                            lease.session.last_response = None;
+                            lease.session.turn_state = None;
+                        }
+                        break;
+                    }
+                }
+                Message::Ping(payload) => {
+                    let send_result = match lease.session.connection.as_mut() {
+                        Some(websocket) => websocket.send(Message::Pong(payload)).await,
+                        None => return,
+                    };
+                    if send_result.is_err() {
+                        stream_diagnostics.finish("transport_error");
+                        yield Err(std::io::Error::other("failed to answer websocket ping"));
+                        return;
+                    }
+                }
+                Message::Close(_) => {
+                    stream_diagnostics.finish("transport_error");
+                    yield Err(std::io::Error::other(
+                        "Codex websocket closed before a terminal response",
+                    ));
+                    return;
+                }
+                Message::Binary(_) | Message::Pong(_) | Message::Frame(_) => {}
+            }
+        }
+        for event in transformer.finish() {
+            yield Ok(Bytes::from(event));
+        }
+        stream_diagnostics.observe_filtered_keepalives(
+            transformer.take_filtered_keepalive_events(),
+        );
+        stream_diagnostics.finish(outcome);
+        lease.mark_finished();
+    }
+}
+
+fn websocket_previous_response_not_found(payload: &str) -> bool {
+    let Ok(event) = serde_json::from_str::<Value>(payload) else {
+        return false;
+    };
+    event.get("type").and_then(Value::as_str) == Some("error")
+        && event
+            .get("error")
+            .and_then(|error| error.get("code"))
+            .and_then(Value::as_str)
+            == Some("previous_response_not_found")
+}
+
+fn websocket_event_turn_state(payload: &str) -> Option<String> {
+    let event = serde_json::from_str::<Value>(payload).ok()?;
+    event
+        .get("headers")?
+        .get("x-codex-turn-state")?
+        .as_str()
+        .map(str::to_owned)
+}
+
+fn completed_websocket_response(payload: &str) -> Option<CachedWebSocketResponse> {
+    let event = serde_json::from_str::<Value>(payload).ok()?;
+    if event.get("type").and_then(Value::as_str) != Some("response.completed") {
+        return None;
+    }
+    let response = event.get("response")?;
+    Some(CachedWebSocketResponse {
+        response_id: response.get("id")?.as_str()?.to_owned(),
+        output: response
+            .get("output")
+            .and_then(Value::as_array)
+            .cloned()
+            .unwrap_or_default(),
+    })
+}
+
+fn is_internal_websocket_event(payload: &str) -> bool {
+    serde_json::from_str::<Value>(payload)
+        .ok()
+        .and_then(|event| event.get("type").and_then(Value::as_str).map(str::to_owned))
+        .is_some_and(|kind| kind.starts_with("responsesapi.") || kind.starts_with("codex."))
+}
+
+fn websocket_event_is_terminal(payload: &str) -> bool {
+    serde_json::from_str::<Value>(payload)
+        .ok()
+        .and_then(|event| event.get("type").and_then(Value::as_str).map(str::to_owned))
+        .is_some_and(|kind| {
+            matches!(
+                kind.as_str(),
+                "response.completed" | "response.failed" | "response.incomplete" | "error"
+            )
+        })
 }
 
 async fn stream_response(upstream: reqwest::Response, diagnostics: RequestDiagnostics) -> Response {
@@ -430,6 +1243,10 @@ async fn stream_response(upstream: reqwest::Response, diagnostics: RequestDiagno
     let mut response = Response::new(Body::from_stream(stream));
     *response.status_mut() = status;
     copy_response_headers(&source_headers, &mut response);
+    response.headers_mut().insert(
+        "x-codex-upstream-transport",
+        HeaderValue::from_static("http-sse"),
+    );
     response
 }
 
@@ -508,11 +1325,18 @@ struct RequestDiagnostics {
     started_at: Instant,
     client_request_id: String,
     model: String,
+    session_id_fingerprint: String,
+    thread_id_fingerprint: String,
     prompt_cache_key_fingerprint: Option<String>,
 }
 
 impl RequestDiagnostics {
-    fn new(started_at: Instant, headers: &HeaderMap, request: &Value) -> Self {
+    fn new(
+        started_at: Instant,
+        headers: &HeaderMap,
+        request: &Value,
+        ids: &UpstreamRequestIds,
+    ) -> Self {
         Self {
             started_at,
             client_request_id: headers
@@ -531,6 +1355,8 @@ impl RequestDiagnostics {
                 .and_then(Value::as_str)
                 .unwrap_or("<missing>")
                 .to_owned(),
+            session_id_fingerprint: identifier_fingerprint(&ids.session_id),
+            thread_id_fingerprint: identifier_fingerprint(&ids.thread_id),
             prompt_cache_key_fingerprint: request
                 .get("prompt_cache_key")
                 .and_then(Value::as_str)
@@ -543,6 +1369,8 @@ impl RequestDiagnostics {
         tracing::info!(
             client_request_id = self.client_request_id.as_str(),
             model = self.model.as_str(),
+            session_id_fingerprint = self.session_id_fingerprint.as_str(),
+            thread_id_fingerprint = self.thread_id_fingerprint.as_str(),
             prompt_cache_key_present = self.prompt_cache_key_fingerprint.is_some(),
             prompt_cache_key_fingerprint = self
                 .prompt_cache_key_fingerprint
@@ -619,11 +1447,103 @@ struct CompletionMetrics {
     cached_input_tokens: Option<u64>,
 }
 
-fn cache_key_fingerprint(key: &str) -> String {
+struct WebSocketStreamDiagnostics {
+    request: RequestDiagnostics,
+    mode: WebSocketRequestMode,
+    first_event_logged: bool,
+    sse_error_type: Option<String>,
+    metrics: CompletionMetrics,
+    finished: bool,
+}
+
+impl WebSocketStreamDiagnostics {
+    fn new(request: RequestDiagnostics, mode: WebSocketRequestMode) -> Self {
+        Self {
+            request,
+            mode,
+            first_event_logged: false,
+            sse_error_type: None,
+            metrics: CompletionMetrics::default(),
+            finished: false,
+        }
+    }
+
+    fn observe_event(&mut self, event: &[u8]) {
+        self.metrics.bytes_received = self.metrics.bytes_received.saturating_add(event.len());
+        self.metrics.chunks_received = self.metrics.chunks_received.saturating_add(1);
+        if !self.first_event_logged {
+            self.first_event_logged = true;
+            tracing::info!(
+                client_request_id = self.request.client_request_id.as_str(),
+                model = self.request.model.as_str(),
+                ttfb_ms = elapsed_ms(self.request.started_at),
+                first_event_bytes = event.len(),
+                transport = "websocket",
+                connection_reused = self.mode.connection_reused,
+                incremental_request = self.mode.incremental,
+                "Codex upstream first WebSocket event received"
+            );
+        }
+        if let Some((input_tokens, cached_input_tokens)) = extract_cache_usage(event) {
+            self.metrics.input_tokens = Some(input_tokens);
+            self.metrics.cached_input_tokens = Some(cached_input_tokens);
+        }
+        if self.sse_error_type.is_none()
+            && let Some(error_type) = extract_sse_error_type(event)
+        {
+            tracing::warn!(
+                client_request_id = self.request.client_request_id.as_str(),
+                model = self.request.model.as_str(),
+                sse_error_type = error_type.as_str(),
+                elapsed_ms = elapsed_ms(self.request.started_at),
+                transport = "websocket",
+                "Codex upstream WebSocket error received"
+            );
+            self.sse_error_type = Some(error_type);
+        }
+    }
+
+    fn observe_filtered_keepalives(&mut self, count: u64) {
+        self.metrics.filtered_keepalive_events =
+            self.metrics.filtered_keepalive_events.saturating_add(count);
+    }
+
+    fn finish(&mut self, outcome: &str) {
+        if self.finished {
+            return;
+        }
+        self.finished = true;
+        self.request.log_completed(
+            outcome,
+            "<missing>",
+            self.sse_error_type.as_deref(),
+            self.metrics,
+        );
+    }
+}
+
+impl Drop for WebSocketStreamDiagnostics {
+    fn drop(&mut self) {
+        if !self.finished {
+            self.request.log_completed(
+                "client_disconnected",
+                "<missing>",
+                self.sse_error_type.as_deref(),
+                self.metrics,
+            );
+        }
+    }
+}
+
+fn identifier_fingerprint(key: &str) -> String {
     Sha256::digest(key.as_bytes())[..8]
         .iter()
         .map(|byte| format!("{byte:02x}"))
         .collect()
+}
+
+fn cache_key_fingerprint(key: &str) -> String {
+    identifier_fingerprint(key)
 }
 
 struct StreamDiagnostics {
@@ -871,6 +1791,8 @@ fn error_response(status: StatusCode, message: &str) -> Response {
 pub enum ProxyError {
     #[error("local proxy credential must not be empty")]
     EmptyLocalSecret,
+    #[error("proxy installation ID must not be empty")]
+    InvalidInstallationId,
     #[error("proxy body and concurrency limits must be positive")]
     InvalidLimit,
     #[error("upstream URL is not allowlisted")]
@@ -884,8 +1806,9 @@ pub enum ProxyError {
 #[cfg(test)]
 mod tests {
     use super::{
-        RequestDiagnostics, extract_sse_error_type, normalize_upstream_error_status,
-        sanitize_error_body,
+        CachedWebSocketResponse, MAX_CACHED_WEBSOCKET_SESSIONS, RequestDiagnostics,
+        WebSocketSession, WebSocketSessionPool, derive_installation_id, extract_sse_error_type,
+        normalize_upstream_error_status, prepare_websocket_request, sanitize_error_body,
     };
     use http::{HeaderMap, StatusCode};
     use serde_json::json;
@@ -929,11 +1852,76 @@ mod tests {
 
     #[test]
     fn request_diagnostics_generates_a_correlation_id_when_grok_omits_one() {
-        let diagnostics =
-            RequestDiagnostics::new(Instant::now(), &HeaderMap::new(), &json!({"model":"test"}));
+        let diagnostics = RequestDiagnostics::new(
+            Instant::now(),
+            &HeaderMap::new(),
+            &json!({"model":"test"}),
+            &codex_protocol::UpstreamRequestIds {
+                installation_id: "installation".into(),
+                session_id: "session".into(),
+                thread_id: "thread".into(),
+                prompt_cache_key: None,
+            },
+        );
 
         assert!(diagnostics.client_request_id.starts_with("proxy-"));
         assert_ne!(diagnostics.client_request_id, "<missing>");
+    }
+
+    #[test]
+    fn installation_id_is_stable_without_exposing_the_proxy_secret() {
+        let first = derive_installation_id("local-secret");
+        let second = derive_installation_id("local-secret");
+        let different = derive_installation_id("other-secret");
+
+        assert_eq!(first, second);
+        assert_ne!(first, different);
+        assert!(!first.contains("local-secret"));
+    }
+
+    #[test]
+    fn incremental_request_falls_back_to_full_when_non_input_properties_change() {
+        let previous = json!({
+            "model": "gpt-test",
+            "tools": [{"type": "function", "name": "first"}],
+            "input": [{"type": "message", "role": "user", "content": "one"}]
+        });
+        let current = json!({
+            "model": "gpt-test",
+            "tools": [{"type": "function", "name": "changed"}],
+            "input": [
+                {"type": "message", "role": "user", "content": "one"},
+                {"type": "message", "role": "user", "content": "two"}
+            ]
+        });
+        let session = WebSocketSession {
+            last_request: Some(previous),
+            last_response: Some(CachedWebSocketResponse {
+                response_id: "resp-1".into(),
+                output: Vec::new(),
+            }),
+            ..WebSocketSession::default()
+        };
+
+        let prepared = prepare_websocket_request(&current, &session);
+
+        assert!(!prepared.incremental);
+        assert!(prepared.payload.get("previous_response_id").is_none());
+        assert_eq!(prepared.payload["input"], current["input"]);
+    }
+
+    #[tokio::test]
+    async fn websocket_session_pool_stays_bounded() {
+        let pool = WebSocketSessionPool::default();
+        for index in 0..MAX_CACHED_WEBSOCKET_SESSIONS + 10 {
+            let session = pool.get(format!("session-{index}")).await;
+            drop(session);
+        }
+
+        assert_eq!(
+            pool.sessions.lock().await.len(),
+            MAX_CACHED_WEBSOCKET_SESSIONS
+        );
     }
 
     #[test]

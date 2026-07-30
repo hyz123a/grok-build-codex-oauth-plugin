@@ -15,9 +15,17 @@ use axum::{
 };
 use codex_oauth::AccessCredential;
 use codex_proxy::{CredentialProvider, ProxyConfig, build_router};
+use futures_util::{SinkExt, StreamExt};
 use http_body_util::BodyExt;
 use serde_json::{Value, json};
 use tokio::sync::Mutex;
+use tokio_tungstenite::{
+    accept_hdr_async,
+    tungstenite::{
+        Message,
+        handshake::server::{Request as WebSocketRequest, Response as WebSocketResponse},
+    },
+};
 use tracing_subscriber::fmt::MakeWriter;
 
 #[derive(Clone)]
@@ -82,7 +90,8 @@ async fn proxy_requires_local_secret_and_forwards_transformed_sse() {
         refreshes: Arc::new(AtomicUsize::new(0)),
     };
     let app = build_router(
-        ProxyConfig::for_test(upstream_url, "local-secret"),
+        ProxyConfig::for_test(upstream_url, "local-secret")
+            .with_installation_id("proxy-installation-1"),
         Arc::new(credentials),
     )
     .expect("router");
@@ -144,7 +153,8 @@ async fn explicit_prompt_cache_key_takes_precedence_over_grok_session_id() {
     let captures = Captures::default();
     let upstream_url = spawn_upstream(captures.clone()).await;
     let app = build_router(
-        ProxyConfig::for_test(upstream_url, "local-secret"),
+        ProxyConfig::for_test(upstream_url, "local-secret")
+            .with_installation_id("proxy-installation-1"),
         Arc::new(StubCredentials {
             refreshes: Arc::new(AtomicUsize::new(0)),
         }),
@@ -157,6 +167,7 @@ async fn explicit_prompt_cache_key_takes_precedence_over_grok_session_id() {
             .header("authorization", "Bearer local-secret")
             .header("content-type", "application/json")
             .header("x-grok-session-id", "grok-session-ignored")
+            .header("x-grok-thread-id", "grok-thread-42")
             .body(Body::from(
                 r#"{"prompt_cache_key":"explicit-cache-key","input":[]}"#,
             ))
@@ -167,9 +178,753 @@ async fn explicit_prompt_cache_key_takes_precedence_over_grok_session_id() {
 
     assert_eq!(response.status(), StatusCode::OK);
     let captures = captures.0.lock().await;
-    assert_eq!(captures[0].0["session-id"], "explicit-cache-key");
-    assert_eq!(captures[0].0["thread-id"], "explicit-cache-key");
+    assert_eq!(captures[0].0["session-id"], "grok-session-ignored");
+    assert_eq!(captures[0].0["thread-id"], "grok-thread-42");
     assert_eq!(captures[0].1["prompt_cache_key"], "explicit-cache-key");
+}
+
+#[derive(Clone, Default)]
+struct WebSocketCaptures {
+    headers: Arc<StdMutex<Option<HeaderMap>>>,
+    request: Arc<Mutex<Option<Value>>>,
+}
+
+#[derive(Clone, Default)]
+struct ReuseWebSocketCaptures {
+    connections: Arc<AtomicUsize>,
+    requests: Arc<Mutex<Vec<Value>>>,
+}
+
+#[allow(clippy::result_large_err)]
+async fn spawn_reusing_websocket_upstream(captures: ReuseWebSocketCaptures) -> String {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind reusable websocket");
+    let address = listener.local_addr().expect("reusable websocket addr");
+    tokio::spawn(async move {
+        loop {
+            let (stream, _) = listener.accept().await.expect("accept reusable websocket");
+            captures.connections.fetch_add(1, Ordering::SeqCst);
+            let captures = captures.clone();
+            tokio::spawn(async move {
+                let mut websocket = accept_hdr_async(
+                    stream,
+                    |_request: &WebSocketRequest, mut response: WebSocketResponse| {
+                        response.headers_mut().insert(
+                            "x-codex-turn-state",
+                            "handshake-turn-state".parse().expect("turn state header"),
+                        );
+                        Ok(response)
+                    },
+                )
+                .await
+                .expect("reusable websocket handshake");
+                while let Some(message) = websocket.next().await {
+                    let Message::Text(text) = message.expect("valid reusable websocket message")
+                    else {
+                        continue;
+                    };
+                    let request: Value =
+                        serde_json::from_str(&text).expect("reusable websocket request json");
+                    let request_index = {
+                        let mut requests = captures.requests.lock().await;
+                        requests.push(request);
+                        requests.len()
+                    };
+                    websocket
+                        .send(Message::Text(
+                            json!({
+                                "type": "codex.response.metadata",
+                                "headers": {
+                                    "x-codex-turn-state": format!("turn-state-{request_index}")
+                                }
+                            })
+                            .to_string()
+                            .into(),
+                        ))
+                        .await
+                        .expect("send reusable metadata");
+                    let output = match request_index {
+                        1 => json!([{
+                            "type": "message",
+                            "id": "msg-1",
+                            "role": "assistant",
+                            "status": "completed",
+                            "content": [{
+                                "type": "output_text",
+                                "text": "first",
+                                "annotations": []
+                            }]
+                        }]),
+                        2 => json!([{
+                            "type": "function_call",
+                            "id": "fc-2",
+                            "call_id": "call-2",
+                            "name": "lookup",
+                            "arguments": "{}",
+                            "status": "completed"
+                        }]),
+                        _ => json!([]),
+                    };
+                    websocket
+                        .send(Message::Text(
+                            json!({
+                                "type": "response.completed",
+                                "response": {
+                                    "id": format!("resp-{request_index}"),
+                                    "status": "completed",
+                                    "output": output,
+                                    "usage": {
+                                        "input_tokens": 100,
+                                        "input_tokens_details": {"cached_tokens": 80}
+                                    }
+                                }
+                            })
+                            .to_string()
+                            .into(),
+                        ))
+                        .await
+                        .expect("send reusable completion");
+                    websocket
+                        .send(Message::Text(
+                            json!({
+                                "type": "responsesapi.websocket_timing",
+                                "elapsed_ms": 1
+                            })
+                            .to_string()
+                            .into(),
+                        ))
+                        .await
+                        .expect("send trailing reusable metadata");
+                }
+            });
+        }
+    });
+    format!("ws://{address}/responses")
+}
+
+#[allow(clippy::result_large_err)]
+async fn spawn_closing_websocket_upstream(captures: ReuseWebSocketCaptures) -> String {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind closing websocket");
+    let address = listener.local_addr().expect("closing websocket addr");
+    tokio::spawn(async move {
+        loop {
+            let (stream, _) = listener.accept().await.expect("accept closing websocket");
+            captures.connections.fetch_add(1, Ordering::SeqCst);
+            let captures = captures.clone();
+            tokio::spawn(async move {
+                let mut websocket = accept_hdr_async(
+                    stream,
+                    |_request: &WebSocketRequest, response: WebSocketResponse| Ok(response),
+                )
+                .await
+                .expect("closing websocket handshake");
+                let Some(Ok(Message::Text(text))) = websocket.next().await else {
+                    return;
+                };
+                let request: Value =
+                    serde_json::from_str(&text).expect("closing websocket request json");
+                let request_index = {
+                    let mut requests = captures.requests.lock().await;
+                    requests.push(request);
+                    requests.len()
+                };
+                websocket
+                    .send(Message::Text(
+                        json!({
+                            "type": "response.completed",
+                            "response": {
+                                "id": format!("closing-resp-{request_index}"),
+                                "status": "completed",
+                                "output": []
+                            }
+                        })
+                        .to_string()
+                        .into(),
+                    ))
+                    .await
+                    .expect("send closing completion");
+                websocket
+                    .close(None)
+                    .await
+                    .expect("close websocket after completion");
+            });
+        }
+    });
+    format!("ws://{address}/responses")
+}
+
+#[allow(clippy::result_large_err)]
+async fn spawn_refreshing_websocket_upstream(attempts: Arc<AtomicUsize>) -> String {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind refreshing websocket");
+    let address = listener.local_addr().expect("refreshing websocket addr");
+    tokio::spawn(async move {
+        loop {
+            let (stream, _) = listener
+                .accept()
+                .await
+                .expect("accept refreshing websocket");
+            attempts.fetch_add(1, Ordering::SeqCst);
+            tokio::spawn(async move {
+                let websocket = accept_hdr_async(
+                    stream,
+                    |request: &WebSocketRequest, response: WebSocketResponse| {
+                        if request.headers().get("authorization")
+                            != Some(&"Bearer refreshed-secret".parse().expect("auth header"))
+                        {
+                            return Err(http::Response::builder()
+                                .status(StatusCode::UNAUTHORIZED)
+                                .body(Some("expired".to_string()))
+                                .expect("unauthorized websocket response"));
+                        }
+                        Ok(response)
+                    },
+                )
+                .await;
+                let Ok(mut websocket) = websocket else {
+                    return;
+                };
+                let Some(Ok(Message::Text(_))) = websocket.next().await else {
+                    return;
+                };
+                websocket
+                    .send(Message::Text(
+                        r#"{"type":"response.completed","response":{"id":"resp-refreshed","status":"completed","output":[]}}"#
+                            .into(),
+                    ))
+                    .await
+                    .expect("send refreshed completion");
+            });
+        }
+    });
+    format!("ws://{address}/responses")
+}
+
+#[allow(clippy::result_large_err)]
+async fn spawn_previous_missing_websocket_upstream(captures: ReuseWebSocketCaptures) -> String {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind previous-missing websocket");
+    let address = listener
+        .local_addr()
+        .expect("previous-missing websocket addr");
+    tokio::spawn(async move {
+        let (stream, _) = listener
+            .accept()
+            .await
+            .expect("accept previous-missing websocket");
+        captures.connections.fetch_add(1, Ordering::SeqCst);
+        let mut websocket = accept_hdr_async(
+            stream,
+            |_request: &WebSocketRequest, response: WebSocketResponse| Ok(response),
+        )
+        .await
+        .expect("previous-missing websocket handshake");
+        while let Some(Ok(Message::Text(text))) = websocket.next().await {
+            let request: Value =
+                serde_json::from_str(&text).expect("previous-missing request json");
+            let request_index = {
+                let mut requests = captures.requests.lock().await;
+                requests.push(request);
+                requests.len()
+            };
+            let event = match request_index {
+                1 => json!({
+                    "type": "response.completed",
+                    "response": {
+                        "id": "resp-base",
+                        "status": "completed",
+                        "output": [{
+                            "type": "message",
+                            "id": "msg-base",
+                            "role": "assistant",
+                            "status": "completed",
+                            "content": [{
+                                "type": "output_text",
+                                "text": "base",
+                                "annotations": []
+                            }]
+                        }]
+                    }
+                }),
+                2 => json!({
+                    "type": "error",
+                    "error": {
+                        "type": "invalid_request_error",
+                        "code": "previous_response_not_found",
+                        "message": "retry the full request"
+                    }
+                }),
+                _ => json!({
+                    "type": "response.completed",
+                    "response": {
+                        "id": "resp-retried",
+                        "status": "completed",
+                        "output": []
+                    }
+                }),
+            };
+            websocket
+                .send(Message::Text(event.to_string().into()))
+                .await
+                .expect("send previous-missing event");
+        }
+    });
+    format!("ws://{address}/responses")
+}
+
+#[allow(clippy::result_large_err)]
+async fn spawn_websocket_upstream(captures: WebSocketCaptures) -> String {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind websocket");
+    let address = listener.local_addr().expect("websocket addr");
+    tokio::spawn(async move {
+        let (stream, _) = listener.accept().await.expect("accept websocket");
+        let header_capture = captures.headers.clone();
+        let mut websocket = accept_hdr_async(
+            stream,
+            move |request: &WebSocketRequest, response: WebSocketResponse| {
+                *header_capture.lock().expect("capture websocket headers") =
+                    Some(request.headers().clone());
+                Ok(response)
+            },
+        )
+        .await
+        .expect("websocket handshake");
+        let message = websocket
+            .next()
+            .await
+            .expect("websocket request")
+            .expect("valid websocket request");
+        let Message::Text(text) = message else {
+            panic!("expected text websocket request");
+        };
+        *captures.request.lock().await =
+            Some(serde_json::from_str(&text).expect("websocket request json"));
+        websocket
+            .send(Message::Text(
+                r#"{"type":"responsesapi.websocket_timing","elapsed_ms":1}"#.into(),
+            ))
+            .await
+            .expect("send timing");
+        websocket
+            .send(Message::Text(
+                r#"{"type":"codex.response.metadata","request_id":"request-ws"}"#.into(),
+            ))
+            .await
+            .expect("send metadata");
+        websocket
+            .send(Message::Text(
+                r#"{"type":"response.created","response":{"id":"resp-ws"}}"#.into(),
+            ))
+            .await
+            .expect("send created");
+        websocket
+            .send(Message::Text(
+                r#"{"type":"response.completed","response":{"id":"resp-ws","status":"completed","output":[]}}"#
+                    .into(),
+            ))
+            .await
+            .expect("send completed");
+    });
+    format!("ws://{address}/responses")
+}
+
+#[tokio::test]
+async fn websocket_is_preferred_and_bridged_to_downstream_sse() {
+    let http_captures = Captures::default();
+    let http_url = spawn_upstream(http_captures.clone()).await;
+    let websocket_captures = WebSocketCaptures::default();
+    let websocket_url = spawn_websocket_upstream(websocket_captures.clone()).await;
+    let app = build_router(
+        ProxyConfig::for_test(http_url, "local-secret")
+            .with_installation_id("proxy-installation-1")
+            .with_websocket_upstream(websocket_url),
+        Arc::new(StubCredentials {
+            refreshes: Arc::new(AtomicUsize::new(0)),
+        }),
+    )
+    .expect("router");
+
+    let response = tower::ServiceExt::oneshot(
+        app,
+        axum::http::Request::post("/v1/responses")
+            .header("authorization", "Bearer local-secret")
+            .header("content-type", "application/json")
+            .header("x-request-id", "request-ws-test")
+            .header("x-grok-session-id", "grok-session-42")
+            .header("x-grok-thread-id", "grok-thread-42")
+            .body(Body::from(r#"{"model":"gpt-test","input":[]}"#))
+            .expect("request"),
+    )
+    .await
+    .expect("response");
+
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        response.headers()["x-codex-upstream-transport"],
+        "websocket"
+    );
+    let body = response
+        .into_body()
+        .collect()
+        .await
+        .expect("websocket response body")
+        .to_bytes();
+    let body = String::from_utf8(body.to_vec()).expect("utf8 SSE");
+    assert!(body.contains(r#""type":"response.created""#));
+    assert!(body.contains(r#""type":"response.completed""#));
+    assert!(!body.contains("responsesapi.websocket_timing"));
+    assert!(!body.contains("codex.response.metadata"));
+    assert!(http_captures.0.lock().await.is_empty());
+
+    {
+        let headers = websocket_captures
+            .headers
+            .lock()
+            .expect("captured websocket headers lock");
+        let headers = headers.as_ref().expect("captured websocket headers");
+        assert_eq!(headers["session-id"], "grok-session-42");
+        assert_eq!(headers["thread-id"], "grok-thread-42");
+        assert_eq!(headers["x-client-request-id"], "grok-thread-42");
+        assert_eq!(headers["x-codex-window-id"], "grok-session-42");
+        assert_eq!(headers["openai-beta"], "responses_websockets=2026-02-06");
+    }
+    let request = websocket_captures.request.lock().await;
+    let request = request.as_ref().expect("captured websocket request");
+    assert_eq!(request["type"], "response.create");
+    assert_eq!(request["prompt_cache_key"], "grok-session-42");
+    assert_eq!(
+        request["client_metadata"]["x-codex-installation-id"],
+        "proxy-installation-1"
+    );
+    assert_eq!(
+        request["client_metadata"]["x-codex-window-id"],
+        "grok-session-42"
+    );
+    assert_eq!(request["client_metadata"]["session_id"], "grok-session-42");
+    assert_eq!(request["client_metadata"]["thread_id"], "grok-thread-42");
+    assert_eq!(request["client_metadata"]["turn_id"], "request-ws-test");
+}
+
+#[tokio::test]
+async fn websocket_handshake_failure_falls_back_to_http_sse() {
+    let captures = Captures::default();
+    let http_url = spawn_upstream(captures.clone()).await;
+    let websocket_url = http_url.replacen("http://", "ws://", 1);
+    let app = build_router(
+        ProxyConfig::for_test(&http_url, "local-secret")
+            .with_installation_id("proxy-installation-1")
+            .with_websocket_upstream(websocket_url),
+        Arc::new(StubCredentials {
+            refreshes: Arc::new(AtomicUsize::new(0)),
+        }),
+    )
+    .expect("router");
+
+    let response = tower::ServiceExt::oneshot(
+        app,
+        axum::http::Request::post("/v1/responses")
+            .header("authorization", "Bearer local-secret")
+            .header("content-type", "application/json")
+            .header("x-grok-session-id", "grok-thread-42")
+            .body(Body::from(r#"{"model":"gpt-test","input":[]}"#))
+            .expect("request"),
+    )
+    .await
+    .expect("response");
+
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(response.headers()["x-codex-upstream-transport"], "http-sse");
+    assert_eq!(captures.0.lock().await.len(), 1);
+}
+
+#[tokio::test]
+async fn websocket_connection_and_previous_response_are_reused_conservatively() {
+    let http_captures = Captures::default();
+    let http_url = spawn_upstream(http_captures.clone()).await;
+    let websocket_captures = ReuseWebSocketCaptures::default();
+    let websocket_url = spawn_reusing_websocket_upstream(websocket_captures.clone()).await;
+    let app = build_router(
+        ProxyConfig::for_test(http_url, "local-secret")
+            .with_installation_id("proxy-installation-1")
+            .with_websocket_upstream(websocket_url),
+        Arc::new(StubCredentials {
+            refreshes: Arc::new(AtomicUsize::new(0)),
+        }),
+    )
+    .expect("router");
+
+    let user_one = json!({
+        "type": "message",
+        "role": "user",
+        "content": [{"type": "input_text", "text": "first"}]
+    });
+    let assistant_one = json!({
+        "type": "message",
+        "id": "msg-1",
+        "role": "assistant",
+        "status": "completed",
+        "content": [{
+            "type": "output_text",
+            "text": "first",
+            "annotations": []
+        }]
+    });
+    let user_two = json!({
+        "type": "message",
+        "role": "user",
+        "content": [{"type": "input_text", "text": "use a tool"}]
+    });
+    let function_call = json!({
+        "type": "function_call",
+        "id": "fc-2",
+        "call_id": "call-2",
+        "name": "lookup",
+        "arguments": "{}",
+        "status": "completed"
+    });
+    let function_output = json!({
+        "type": "function_call_output",
+        "call_id": "call-2",
+        "output": "done"
+    });
+
+    for (request_id, input) in [
+        ("reuse-1", json!([user_one.clone()])),
+        (
+            "reuse-2",
+            json!([user_one.clone(), assistant_one, user_two.clone()]),
+        ),
+        (
+            "reuse-3",
+            json!([
+                user_one,
+                json!({
+                    "type": "message",
+                    "id": "msg-1",
+                    "role": "assistant",
+                    "status": "completed",
+                    "content": [{
+                        "type": "output_text",
+                        "text": "first",
+                        "annotations": []
+                    }]
+                }),
+                user_two,
+                function_call,
+                function_output.clone()
+            ]),
+        ),
+    ] {
+        let response = tower::ServiceExt::oneshot(
+            app.clone(),
+            axum::http::Request::post("/v1/responses")
+                .header("authorization", "Bearer local-secret")
+                .header("content-type", "application/json")
+                .header("x-request-id", request_id)
+                .header("x-grok-session-id", "grok-session-reuse")
+                .body(Body::from(
+                    json!({"model":"gpt-test","input":input}).to_string(),
+                ))
+                .expect("request"),
+        )
+        .await
+        .expect("response");
+        assert_eq!(response.status(), StatusCode::OK);
+        response
+            .into_body()
+            .collect()
+            .await
+            .expect("collect reusable websocket response");
+    }
+
+    assert_eq!(websocket_captures.connections.load(Ordering::SeqCst), 1);
+    assert!(http_captures.0.lock().await.is_empty());
+    let requests = websocket_captures.requests.lock().await;
+    assert_eq!(requests.len(), 3);
+    assert_eq!(requests[1]["previous_response_id"], "resp-1");
+    assert_eq!(
+        requests[1]["input"],
+        json!([{
+            "type": "message",
+            "role": "user",
+            "content": [{"type": "input_text", "text": "use a tool"}]
+        }])
+    );
+    assert!(
+        requests[1]["client_metadata"]
+            .get("x-codex-turn-state")
+            .is_none()
+    );
+    assert_eq!(requests[2]["previous_response_id"], "resp-2");
+    assert_eq!(requests[2]["input"], json!([function_output]));
+    assert_eq!(
+        requests[2]["client_metadata"]["x-codex-turn-state"],
+        "turn-state-2"
+    );
+}
+
+#[tokio::test]
+async fn closed_cached_websocket_is_reconnected_before_the_next_request() {
+    let http_captures = Captures::default();
+    let http_url = spawn_upstream(http_captures.clone()).await;
+    let websocket_captures = ReuseWebSocketCaptures::default();
+    let websocket_url = spawn_closing_websocket_upstream(websocket_captures.clone()).await;
+    let app = build_router(
+        ProxyConfig::for_test(http_url, "local-secret").with_websocket_upstream(websocket_url),
+        Arc::new(StubCredentials {
+            refreshes: Arc::new(AtomicUsize::new(0)),
+        }),
+    )
+    .expect("router");
+
+    for request_id in ["closing-1", "closing-2"] {
+        let response = tower::ServiceExt::oneshot(
+            app.clone(),
+            axum::http::Request::post("/v1/responses")
+                .header("authorization", "Bearer local-secret")
+                .header("content-type", "application/json")
+                .header("x-request-id", request_id)
+                .header("x-grok-session-id", "grok-session-closing")
+                .body(Body::from(
+                    json!({
+                        "model": "gpt-test",
+                        "input": [{
+                            "type": "message",
+                            "role": "user",
+                            "content": request_id
+                        }]
+                    })
+                    .to_string(),
+                ))
+                .expect("request"),
+        )
+        .await
+        .expect("response");
+        response
+            .into_body()
+            .collect()
+            .await
+            .expect("collect response after reconnect");
+    }
+
+    assert_eq!(websocket_captures.connections.load(Ordering::SeqCst), 2);
+    assert_eq!(websocket_captures.requests.lock().await.len(), 2);
+    assert!(http_captures.0.lock().await.is_empty());
+}
+
+#[tokio::test]
+async fn websocket_unauthorized_refreshes_once_without_falling_back_to_http() {
+    let http_captures = Captures::default();
+    let http_url = spawn_upstream(http_captures.clone()).await;
+    let websocket_attempts = Arc::new(AtomicUsize::new(0));
+    let websocket_url = spawn_refreshing_websocket_upstream(websocket_attempts.clone()).await;
+    let refreshes = Arc::new(AtomicUsize::new(0));
+    let app = build_router(
+        ProxyConfig::for_test(http_url, "local-secret").with_websocket_upstream(websocket_url),
+        Arc::new(StubCredentials {
+            refreshes: refreshes.clone(),
+        }),
+    )
+    .expect("router");
+
+    let response = tower::ServiceExt::oneshot(
+        app,
+        axum::http::Request::post("/v1/responses")
+            .header("authorization", "Bearer local-secret")
+            .header("content-type", "application/json")
+            .header("x-grok-session-id", "grok-session-refresh")
+            .body(Body::from(r#"{"model":"gpt-test","input":[]}"#))
+            .expect("request"),
+    )
+    .await
+    .expect("response");
+    response
+        .into_body()
+        .collect()
+        .await
+        .expect("collect refreshed websocket response");
+
+    assert_eq!(websocket_attempts.load(Ordering::SeqCst), 2);
+    assert_eq!(refreshes.load(Ordering::SeqCst), 1);
+    assert!(http_captures.0.lock().await.is_empty());
+}
+
+#[tokio::test]
+async fn previous_response_not_found_retries_once_with_the_full_request() {
+    let http_captures = Captures::default();
+    let http_url = spawn_upstream(http_captures.clone()).await;
+    let websocket_captures = ReuseWebSocketCaptures::default();
+    let websocket_url = spawn_previous_missing_websocket_upstream(websocket_captures.clone()).await;
+    let app = build_router(
+        ProxyConfig::for_test(http_url, "local-secret").with_websocket_upstream(websocket_url),
+        Arc::new(StubCredentials {
+            refreshes: Arc::new(AtomicUsize::new(0)),
+        }),
+    )
+    .expect("router");
+    let user = json!({"type":"message","role":"user","content":"base"});
+    let assistant = json!({
+        "type": "message",
+        "id": "msg-base",
+        "role": "assistant",
+        "status": "completed",
+        "content": [{
+            "type": "output_text",
+            "text": "base",
+            "annotations": []
+        }]
+    });
+    let next_user = json!({"type":"message","role":"user","content":"next"});
+
+    for (request_id, input) in [
+        ("previous-1", json!([user.clone()])),
+        (
+            "previous-2",
+            json!([user.clone(), assistant, next_user.clone()]),
+        ),
+    ] {
+        let response = tower::ServiceExt::oneshot(
+            app.clone(),
+            axum::http::Request::post("/v1/responses")
+                .header("authorization", "Bearer local-secret")
+                .header("content-type", "application/json")
+                .header("x-request-id", request_id)
+                .header("x-grok-session-id", "grok-session-previous")
+                .body(Body::from(
+                    json!({"model":"gpt-test","input":input}).to_string(),
+                ))
+                .expect("request"),
+        )
+        .await
+        .expect("response");
+        let body = response
+            .into_body()
+            .collect()
+            .await
+            .expect("collect previous-response retry")
+            .to_bytes();
+        assert!(
+            !body
+                .windows("previous_response_not_found".len())
+                .any(|part| { part == b"previous_response_not_found" })
+        );
+    }
+
+    assert_eq!(websocket_captures.connections.load(Ordering::SeqCst), 1);
+    let requests = websocket_captures.requests.lock().await;
+    assert_eq!(requests.len(), 3);
+    assert_eq!(requests[1]["previous_response_id"], "resp-base");
+    assert_eq!(requests[1]["input"], json!([next_user]));
+    assert!(requests[2].get("previous_response_id").is_none());
+    assert_eq!(requests[2]["input"].as_array().map(Vec::len), Some(3));
+    assert!(http_captures.0.lock().await.is_empty());
 }
 
 #[tokio::test]
@@ -199,7 +954,8 @@ async fn usage_limit_404_is_mapped_to_429_and_preserves_retry_after() {
     });
 
     let app = build_router(
-        ProxyConfig::for_test(format!("http://{address}/responses"), "local-secret"),
+        ProxyConfig::for_test(format!("http://{address}/responses"), "local-secret")
+            .with_installation_id("private-installation"),
         Arc::new(StubCredentials {
             refreshes: Arc::new(AtomicUsize::new(0)),
         }),
@@ -409,6 +1165,7 @@ async fn logs_request_timing_upstream_id_sse_error_and_completion_without_error_
             .header("authorization", "Bearer local-secret")
             .header("content-type", "application/json")
             .header("x-request-id", "client-request-7")
+            .header("x-grok-session-id", "private-grok-thread")
             .body(Body::from(
                 r#"{"model":"gpt-5.6-sol","prompt_cache_key":"private-session-key","input":[]}"#,
             ))
@@ -443,10 +1200,14 @@ async fn logs_request_timing_upstream_id_sse_error_and_completion_without_error_
     assert!(logs.contains("filtered_keepalive_events=1"));
     assert!(logs.contains("prompt_cache_key_present=true"));
     assert!(logs.contains("prompt_cache_key_fingerprint="));
+    assert!(logs.contains("session_id_fingerprint="));
+    assert!(logs.contains("thread_id_fingerprint="));
     assert!(logs.contains("cache_usage_present=true"));
     assert!(logs.contains("input_tokens=1000"));
     assert!(logs.contains("cached_input_tokens=750"));
     assert!(logs.contains("cache_hit_ratio_pct=75"));
     assert!(!logs.contains("private-session-key"));
+    assert!(!logs.contains("private-installation"));
+    assert!(!logs.contains("private-grok-thread"));
     assert!(!logs.contains("diagnostic-body-must-not-be-logged"));
 }

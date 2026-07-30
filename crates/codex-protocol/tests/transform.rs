@@ -1,5 +1,6 @@
 use codex_protocol::{
-    CodexSseTransformer, TransformOptions, build_upstream_headers, transform_responses_request,
+    CodexSseTransformer, TransformOptions, UpstreamRequestIds, build_upstream_headers,
+    transform_responses_request,
 };
 use http::{HeaderMap, HeaderValue, header::AUTHORIZATION};
 use serde_json::json;
@@ -113,16 +114,22 @@ fn upstream_headers_replace_local_authorization_and_sensitive_headers() {
     incoming.insert("cookie", HeaderValue::from_static("private=value"));
     incoming.insert("x-request-id", HeaderValue::from_static("request-1"));
 
-    let headers = build_upstream_headers(&incoming, "oauth-token", "account-1", Some("session-42"))
-        .expect("valid headers");
+    let ids = UpstreamRequestIds {
+        installation_id: "proxy-installation-1".into(),
+        session_id: "grok-session-42".into(),
+        thread_id: "grok-thread-42".into(),
+        prompt_cache_key: Some("cache-42".into()),
+    };
+    let headers =
+        build_upstream_headers(&incoming, "oauth-token", "account-1", &ids).expect("valid headers");
 
     assert_eq!(headers[AUTHORIZATION], "Bearer oauth-token");
     assert_eq!(headers["chatgpt-account-id"], "account-1");
     assert_eq!(headers["originator"], "grok-build");
     assert_eq!(headers["accept"], "text/event-stream");
     assert_eq!(headers["x-request-id"], "request-1");
-    assert_eq!(headers["session-id"], "session-42");
-    assert_eq!(headers["thread-id"], "session-42");
+    assert_eq!(headers["session-id"], "grok-session-42");
+    assert_eq!(headers["thread-id"], "grok-thread-42");
     assert!(!headers.contains_key("conversation_id"));
     assert!(!headers.contains_key("session_id"));
     assert!(!headers.contains_key("cookie"));
