@@ -26,8 +26,8 @@ use codex_oauth::{
     build_authorize_url, generate_state, validate_callback,
 };
 use codex_proxy::{
-    CredentialProvider, ProxyConfig, StoredCredentialProvider, build_router,
-    websocket_proxy_configured_from_env,
+    CredentialProvider, ProxyConfig, StoredCredentialProvider, additional_instructions_fingerprint,
+    build_router, websocket_proxy_configured_from_env,
 };
 use directories::BaseDirs;
 use grok_config::{
@@ -44,6 +44,8 @@ const FALLBACK_CODEX_CLIENT_VERSION: &str = "0.145.0";
 const DEFAULT_LOG_LINES: usize = 100;
 const MAX_DAEMON_LOG_BYTES: u64 = 10 * 1024 * 1024;
 const DAEMON_LOG_BACKUPS: usize = 3;
+const MAX_ADDITIONAL_INSTRUCTIONS_BYTES: u64 = 16 * 1024;
+const DEFAULT_ADDITIONAL_INSTRUCTIONS: &str = include_str!("../assets/codex-style-instructions.md");
 
 #[derive(Parser)]
 #[command(version, about = "ChatGPT/Codex OAuth companion for Grok Build")]
@@ -219,6 +221,7 @@ struct AppPaths {
     daemon_log: PathBuf,
     grok_config: PathBuf,
     models_cache: PathBuf,
+    additional_instructions: PathBuf,
 }
 
 impl AppPaths {
@@ -233,6 +236,7 @@ impl AppPaths {
             daemon_log: data_dir.join("daemon.log"),
             grok_config: grok_dir.join("config.toml"),
             models_cache: data_dir.join("models-cache.json"),
+            additional_instructions: data_dir.join("additional-instructions.md"),
             data_dir,
         })
     }
@@ -482,6 +486,12 @@ fn setup(paths: &AppPaths, model: &str, port: u16) -> Result<()> {
             generated
         }
     };
+    if !paths.additional_instructions.exists() {
+        write_private_file(
+            &paths.additional_instructions,
+            DEFAULT_ADDITIONAL_INSTRUCTIONS.as_bytes(),
+        )?;
+    }
     install_model_catalog(&paths.grok_config, &ModelConfig::new(model, port, secret))?;
     println!("Configured selectable Codex models at http://127.0.0.1:{port}/v1.");
     Ok(())
@@ -516,6 +526,9 @@ async fn serve(paths: &AppPaths, port: u16) -> Result<()> {
         .map(|(_, model, _)| (*model).to_string())
         .collect::<Vec<_>>();
     let mut proxy_config = ProxyConfig::production(secret)?.with_websocket_proxy_from_env()?;
+    if let Some(instructions) = load_additional_instructions(&paths.additional_instructions)? {
+        proxy_config = proxy_config.with_additional_instructions(instructions);
+    }
     match load_cached_catalog(&paths.models_cache) {
         Ok(Some(models)) => {
             for model in models {
@@ -572,14 +585,21 @@ async fn shutdown_signal() {
 
 async fn ensure_daemon(paths: &AppPaths, port: u16) -> Result<()> {
     let expected_websocket_proxy = websocket_proxy_configured_from_env()?;
-    if let Some(active_websocket_proxy) = health_status(port).await {
-        if active_websocket_proxy == expected_websocket_proxy {
+    let instructions = load_additional_instructions(&paths.additional_instructions)?;
+    let expected_instructions_fingerprint =
+        additional_instructions_fingerprint(instructions.as_deref());
+    if let Some(active) = health_status(port).await {
+        if active.websocket_proxy == expected_websocket_proxy
+            && active.additional_instructions_fingerprint == expected_instructions_fingerprint
+        {
             return Ok(());
         }
         tracing::info!(
-            active_websocket_proxy,
+            active_websocket_proxy = active.websocket_proxy,
             expected_websocket_proxy,
-            "Restarting Codex OAuth daemon because outbound proxy configuration changed"
+            instructions_changed =
+                active.additional_instructions_fingerprint != expected_instructions_fingerprint,
+            "Restarting Codex OAuth daemon because runtime configuration changed"
         );
         stop_daemon(paths)?;
         for _ in 0..40 {
@@ -912,7 +932,13 @@ async fn health(port: u16) -> bool {
     health_status(port).await.is_some()
 }
 
-async fn health_status(port: u16) -> Option<bool> {
+#[derive(Debug, PartialEq, Eq)]
+struct DaemonHealth {
+    websocket_proxy: bool,
+    additional_instructions_fingerprint: Option<String>,
+}
+
+async fn health_status(port: u16) -> Option<DaemonHealth> {
     let response = reqwest::Client::new()
         .get(format!("http://127.0.0.1:{port}/health"))
         .timeout(Duration::from_millis(300))
@@ -923,11 +949,55 @@ async fn health_status(port: u16) -> Option<bool> {
         return None;
     }
     let body = response.json::<serde_json::Value>().await.ok()?;
-    Some(
-        body.get("websocket_proxy")
+    Some(DaemonHealth {
+        websocket_proxy: body
+            .get("websocket_proxy")
             .and_then(serde_json::Value::as_bool)
             .unwrap_or(false),
-    )
+        additional_instructions_fingerprint: body
+            .get("additional_instructions_fingerprint")
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_owned),
+    })
+}
+
+fn load_additional_instructions(path: &Path) -> Result<Option<String>> {
+    let metadata = match fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error.into()),
+    };
+    if !metadata.file_type().is_file() {
+        bail!(
+            "additional instructions must be a regular file: {}",
+            path.display()
+        );
+    }
+    if metadata.len() > MAX_ADDITIONAL_INSTRUCTIONS_BYTES {
+        bail!(
+            "additional instructions exceed {} bytes: {}",
+            MAX_ADDITIONAL_INSTRUCTIONS_BYTES,
+            path.display()
+        );
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        if metadata.permissions().mode() & 0o077 != 0 {
+            bail!(
+                "additional instructions must not be accessible by group or other users: {}",
+                path.display()
+            );
+        }
+    }
+    let instructions = fs::read_to_string(path).with_context(|| {
+        format!(
+            "could not read additional instructions at {}",
+            path.display()
+        )
+    })?;
+    let instructions = instructions.trim();
+    Ok((!instructions.is_empty()).then(|| instructions.to_owned()))
 }
 
 fn read_secret(paths: &AppPaths) -> Result<String> {
@@ -1018,6 +1088,21 @@ fn check(value: bool) -> &'static str {
 mod tests {
     use super::*;
 
+    fn test_paths(root: &Path) -> AppPaths {
+        let grok_dir = root.join(".grok");
+        let data_dir = grok_dir.join("codex-oauth");
+        AppPaths {
+            credentials: data_dir.join("credentials.json"),
+            proxy_secret: data_dir.join("proxy-secret"),
+            daemon_pid: data_dir.join("daemon.pid"),
+            daemon_log: data_dir.join("daemon.log"),
+            grok_config: grok_dir.join("config.toml"),
+            models_cache: data_dir.join("models-cache.json"),
+            additional_instructions: data_dir.join("additional-instructions.md"),
+            data_dir,
+        }
+    }
+
     #[test]
     fn models_sync_is_a_supported_command() {
         let cli =
@@ -1028,6 +1113,67 @@ mod tests {
                 command: ModelsCommand::Sync
             }
         ));
+    }
+
+    #[test]
+    fn setup_installs_private_default_instructions_without_overwriting_custom_content() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let paths = test_paths(directory.path());
+
+        setup(&paths, "gpt-5.6-sol", 1456).expect("initial setup");
+        assert_eq!(
+            fs::read_to_string(&paths.additional_instructions).expect("read default"),
+            DEFAULT_ADDITIONAL_INSTRUCTIONS
+        );
+
+        write_private_file(&paths.additional_instructions, b"Custom local style.\n")
+            .expect("customize instructions");
+        setup(&paths, "gpt-5.6-sol", 1456).expect("repeat setup");
+        assert_eq!(
+            fs::read_to_string(&paths.additional_instructions).expect("read custom"),
+            "Custom local style.\n"
+        );
+    }
+
+    #[test]
+    fn additional_instructions_loader_trims_private_regular_files() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let path = directory.path().join("instructions.md");
+        write_private_file(&path, b"\n Trusted local style. \n").expect("write instructions");
+
+        assert_eq!(
+            load_additional_instructions(&path).expect("load instructions"),
+            Some("Trusted local style.".into())
+        );
+    }
+
+    #[test]
+    fn additional_instructions_loader_rejects_oversized_files() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let path = directory.path().join("instructions.md");
+        write_private_file(
+            &path,
+            &vec![b'x'; MAX_ADDITIONAL_INSTRUCTIONS_BYTES as usize + 1],
+        )
+        .expect("write oversized instructions");
+
+        assert!(load_additional_instructions(&path).is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn additional_instructions_loader_rejects_symlinks_and_open_permissions() {
+        use std::os::unix::fs::{PermissionsExt, symlink};
+
+        let directory = tempfile::tempdir().expect("tempdir");
+        let target = directory.path().join("target.md");
+        let link = directory.path().join("link.md");
+        write_private_file(&target, b"Trusted local style.").expect("write target");
+        symlink(&target, &link).expect("create symlink");
+        assert!(load_additional_instructions(&link).is_err());
+
+        fs::set_permissions(&target, fs::Permissions::from_mode(0o644)).expect("open permissions");
+        assert!(load_additional_instructions(&target).is_err());
     }
 
     #[test]

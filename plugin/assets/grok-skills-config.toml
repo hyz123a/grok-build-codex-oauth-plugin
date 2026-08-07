@@ -1,0 +1,14 @@
+# Copy this user-level configuration into ~/.grok/config.toml.
+# Grok does not load [skills] from a project-scoped .grok/config.toml.
+
+[skills]
+disabled = [
+    "docx",
+    "pdf",
+    "pptx",
+    "game-animation-frames",
+    "game-asset-core",
+    "game-character-consistency",
+    "game-tilesets",
+    "game-ui-icons",
+]

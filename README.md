@@ -18,6 +18,7 @@ stable API. For production or multi-user systems, use the OpenAI Platform API in
 - Filtering of backend-only JSON `keepalive` events that Grok's Responses decoder cannot accept
 - Expiry-window refresh plus one refresh/retry after an upstream `401`
 - Usage-limit error normalization, per-session prompt caching, and model-aware reasoning clamps
+- Private, proxy-owned additional instructions that remain separate from user messages
 - Account-aware Codex model discovery with private local cache and built-in offline fallback
 - Idempotent, scoped edits to managed `[model.codex*]` entries with a config backup
 - Grok skills and a `SessionStart` daemon hook
@@ -89,6 +90,13 @@ logs                   Show or follow proxy diagnostic logs
 `setup` creates `~/.grok/config.toml.bak` before changing an existing configuration. OAuth tokens
 are never written into Grok configuration, environment variables, command arguments, or normal
 logs.
+
+`setup` also creates `~/.grok/codex-oauth/additional-instructions.md` with a concise Codex-style
+communication policy. The proxy reads this private regular file at startup and appends it to the
+top-level Responses `instructions`; it never promotes `<system-reminder>` or other user-message
+content. Existing edits to the file are preserved by later `setup` runs. Run
+`grok-codex-oauth ensure-daemon` after editing it so the instruction fingerprint is checked and the
+daemon is restarted when needed. An empty file disables the additional instructions.
 
 `models sync` queries the authenticated Codex `/models` endpoint and adds every visible,
 API-supported model to Grok's `/model` picker. A successful result is cached at

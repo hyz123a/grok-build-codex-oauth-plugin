@@ -21,8 +21,8 @@ use axum::{
 use base64::{Engine, engine::general_purpose::STANDARD};
 use codex_oauth::{AccessCredential, CredentialStore, Credentials, OAuthClient};
 use codex_protocol::{
-    CodexSseTransformer, TransformOptions, UpstreamRequestIds, build_upstream_headers,
-    transform_responses_request,
+    CodexSseTransformer, TransformOptions, UpstreamRequestIds, append_additional_instructions,
+    build_upstream_headers, transform_responses_request,
 };
 use futures_util::{SinkExt, StreamExt};
 use percent_encoding::percent_decode_str;
@@ -50,6 +50,19 @@ const DEFAULT_HTTP_RESPONSE_HEADERS_TIMEOUT: Duration = Duration::from_secs(30);
 const MAX_PROXY_RESPONSE_HEADERS: usize = 16 * 1024;
 static REQUEST_SEQUENCE: AtomicU64 = AtomicU64::new(1);
 type RawCodexWebSocket = WebSocketStream<MaybeTlsStream<TcpStream>>;
+
+pub fn additional_instructions_fingerprint(instructions: Option<&str>) -> Option<String> {
+    let instructions = instructions
+        .map(str::trim)
+        .filter(|text| !text.is_empty())?;
+    let digest = Sha256::digest(instructions.as_bytes());
+    Some(
+        digest[..8]
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect(),
+    )
+}
 
 pub fn websocket_proxy_configured_from_env() -> Result<bool, ProxyError> {
     let upstream = Url::parse(CODEX_RESPONSES_URL)?;
@@ -242,6 +255,7 @@ pub struct ProxyConfig {
     websocket_proxy: Option<Url>,
     websocket_connect_timeout: Duration,
     http_response_headers_timeout: Duration,
+    additional_instructions: Option<String>,
     allow_test_upstream: bool,
 }
 
@@ -261,6 +275,7 @@ impl ProxyConfig {
             websocket_proxy: None,
             websocket_connect_timeout: DEFAULT_WEBSOCKET_CONNECT_TIMEOUT,
             http_response_headers_timeout: DEFAULT_HTTP_RESPONSE_HEADERS_TIMEOUT,
+            additional_instructions: None,
             allow_test_upstream: false,
         })
     }
@@ -282,6 +297,7 @@ impl ProxyConfig {
             websocket_proxy: None,
             websocket_connect_timeout: DEFAULT_WEBSOCKET_CONNECT_TIMEOUT,
             http_response_headers_timeout: DEFAULT_HTTP_RESPONSE_HEADERS_TIMEOUT,
+            additional_instructions: None,
             allow_test_upstream: true,
         }
     }
@@ -330,6 +346,12 @@ impl ProxyConfig {
     ) -> Self {
         self.websocket_connect_timeout = websocket_connect;
         self.http_response_headers_timeout = http_response_headers;
+        self
+    }
+
+    pub fn with_additional_instructions(mut self, instructions: impl Into<String>) -> Self {
+        self.additional_instructions =
+            Some(instructions.into()).filter(|instructions| !instructions.trim().is_empty());
         self
     }
 
@@ -558,7 +580,10 @@ pub fn build_router(
 async fn health(State(state): State<AppState>) -> Json<Value> {
     Json(json!({
         "status": "ok",
-        "websocket_proxy": state.config.websocket_proxy.is_some()
+        "websocket_proxy": state.config.websocket_proxy.is_some(),
+        "additional_instructions_fingerprint": additional_instructions_fingerprint(
+            state.config.additional_instructions.as_deref()
+        )
     }))
 }
 
@@ -602,6 +627,11 @@ async fn proxy_responses(
         Ok(transformed) => transformed,
         Err(error) => return error_response(StatusCode::BAD_REQUEST, &error.to_string()),
     };
+    if let Some(additional) = state.config.additional_instructions.as_deref()
+        && let Err(error) = append_additional_instructions(&mut transformed, additional)
+    {
+        return error_response(StatusCode::BAD_REQUEST, &error.to_string());
+    }
     let ids =
         resolve_upstream_request_ids(&mut transformed, &headers, &state.config.installation_id);
     let diagnostics = RequestDiagnostics::new(request_started_at, &headers, &transformed, &ids);

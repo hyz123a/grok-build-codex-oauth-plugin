@@ -347,6 +347,37 @@ pub fn transform_responses_request(
     Ok(request)
 }
 
+/// Append proxy-owned instructions after client-provided instructions.
+///
+/// This intentionally does not inspect or promote user messages. The caller is
+/// responsible for sourcing `additional` from a trusted local configuration.
+pub fn append_additional_instructions(
+    request: &mut Value,
+    additional: &str,
+) -> Result<(), ProtocolError> {
+    let additional = additional.trim();
+    if additional.is_empty() {
+        return Ok(());
+    }
+    let object = request
+        .as_object_mut()
+        .ok_or(ProtocolError::RequestMustBeObject)?;
+    match object.get_mut("instructions") {
+        Some(Value::String(existing)) if existing.trim().is_empty() => {
+            *existing = additional.to_owned();
+        }
+        Some(Value::String(existing)) => {
+            existing.push_str("\n\n");
+            existing.push_str(additional);
+        }
+        Some(Value::Null) | None => {
+            object.insert("instructions".into(), Value::String(additional.to_owned()));
+        }
+        Some(_) => return Err(ProtocolError::InstructionsMustBeString),
+    }
+    Ok(())
+}
+
 fn move_instruction_messages(
     object: &mut serde_json::Map<String, Value>,
 ) -> Result<(), ProtocolError> {
