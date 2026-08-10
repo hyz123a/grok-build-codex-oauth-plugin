@@ -15,6 +15,7 @@ stable API. For production or multi-user systems, use the OpenAI Platform API in
 - Fixed-upstream loopback proxy at `127.0.0.1:1456`
 - Local random proxy credential, request-size limit, and concurrency limit
 - Responses JSON adaptation and streaming SSE bridging for Grok terminal-output compatibility
+- Codex-native backend web search routed through the same loopback proxy and OAuth session
 - Filtering of backend-only JSON `keepalive` events that Grok's Responses decoder cannot accept
 - Expiry-window refresh plus one refresh/retry after an upstream `401`
 - Usage-limit error normalization, per-session prompt caching, and model-aware reasoning clamps
@@ -97,6 +98,13 @@ top-level Responses `instructions`; it never promotes `<system-reminder>` or oth
 content. Existing edits to the file are preserved by later `setup` runs. Run
 `grok-codex-oauth ensure-daemon` after editing it so the instruction fingerprint is checked and the
 daemon is restarted when needed. An empty file disables the additional instructions.
+
+`setup` marks the managed Codex model entries as backend-search capable and, when no explicit
+non-Codex search model is configured, sets `[models].web_search` to `codex-sol`. Search requests
+then use Codex's native Responses `web_search` tool through the loopback proxy instead of consuming
+Grok/xAI search-model quota. The protocol bridge maps Grok's hosted `x_search` schema to Codex
+`web_search` and fills the in-progress search action required by Grok's stream decoder. An
+explicitly configured non-Codex search model is preserved.
 
 `models sync` queries the authenticated Codex `/models` endpoint and adds every visible,
 API-supported model to Grok's `/model` picker. A successful result is cached at

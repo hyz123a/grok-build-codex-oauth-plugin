@@ -42,6 +42,27 @@ fn transform_enforces_stateless_streaming_without_losing_grok_fields() {
 }
 
 #[test]
+fn transform_maps_grok_backend_search_to_codex_web_search() {
+    let transformed = transform_responses_request(
+        json!({
+            "input": [{"role": "user", "content": "search"}],
+            "tools": [
+                {"type": "x_search", "provider_specific": true},
+                {"type": "function", "name": "read_file"}
+            ]
+        }),
+        &TransformOptions::default(),
+    )
+    .expect("transform");
+
+    assert_eq!(transformed["tools"][0], json!({"type": "web_search"}));
+    assert_eq!(
+        transformed["tools"][1],
+        json!({"type": "function", "name": "read_file"})
+    );
+}
+
+#[test]
 fn transform_preserves_function_call_pairing_and_deduplicates_include() {
     let request = json!({
         "include": ["reasoning.encrypted_content"],
@@ -215,6 +236,36 @@ data: {"type":"response.completed","response":{"id":"resp-1","status":"completed
     assert!(output.contains(r#""call_id":"call-1""#));
     assert!(output.contains(r#""name":"read_file""#));
     assert!(output.contains(r#""arguments":"{\"path\":\"Cargo.toml\"}""#));
+}
+
+#[test]
+fn sse_bridge_preserves_backend_web_search_items() {
+    let mut bridge = CodexSseTransformer::default();
+    let stream = br#"data: {"type":"response.output_item.added","output_index":0,"item":{"type":"web_search_call","id":"ws-1","status":"in_progress"}}
+
+data: {"type":"response.output_item.done","output_index":0,"item":{"type":"web_search_call","id":"ws-1","status":"completed","action":{"type":"search","query":"Rust latest release"}}}
+
+data: {"type":"response.completed","response":{"id":"resp-1","status":"completed","output":[]}}
+
+"#;
+
+    let mut output = bridge.push(stream);
+    output.extend(bridge.finish());
+    let output = String::from_utf8(output.concat()).expect("utf8 SSE");
+
+    let added = output
+        .split("\n\n")
+        .find_map(|event| event.strip_prefix("data: "))
+        .map(|event| serde_json::from_str::<serde_json::Value>(event).expect("added event"))
+        .expect("added event");
+
+    assert_eq!(
+        added["item"]["action"],
+        json!({"type": "search", "query": "", "queries": []})
+    );
+    assert!(output.contains(r#""type":"web_search_call""#));
+    assert!(output.contains(r#""query":"Rust latest release""#));
+    assert!(output.contains(r#""status":"completed""#));
 }
 
 #[test]

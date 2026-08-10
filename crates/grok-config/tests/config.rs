@@ -25,6 +25,8 @@ fn setup_is_idempotent_and_preserves_unrelated_configuration() {
     assert!(second.contains("[model.codex]"));
     assert!(second.contains("base_url = \"http://127.0.0.1:1456/v1\""));
     assert!(second.contains("api_key = \"secret-1\""));
+    assert!(second.contains("supports_backend_search = true"));
+    assert!(second.contains("[models]\nweb_search = \"codex\""));
     assert!(path.with_extension("toml.bak").exists());
 }
 
@@ -66,6 +68,21 @@ fn catalog_installs_selectable_codex_model_aliases() {
         assert!(result.contains(&format!("[model.{alias}]")));
         assert!(result.contains(&format!("model = \"{model}\"")));
     }
+    assert!(result.contains("supports_backend_search = true"));
+    assert!(result.contains("[models]\nweb_search = \"codex-sol\""));
+}
+
+#[test]
+fn catalog_preserves_an_explicit_non_codex_web_search_model() {
+    let directory = tempfile::tempdir().expect("tempdir");
+    let path = directory.path().join("config.toml");
+    std::fs::write(&path, "[models]\nweb_search = \"my-search\"\n").expect("seed config");
+
+    install_model_catalog(&path, &ModelConfig::new("gpt-5.6-sol", 1456, "secret"))
+        .expect("install catalog");
+
+    let result = std::fs::read_to_string(path).expect("read");
+    assert!(result.contains("web_search = \"my-search\""));
 }
 
 #[test]
@@ -218,7 +235,7 @@ fn uninstall_removes_dynamic_managed_aliases_but_not_user_aliases() {
     let path = directory.path().join("config.toml");
     std::fs::write(
         &path,
-        "[model.codex]\nmodel = \"default\"\n\n[model.codex-gpt-5-7]\nmodel = \"gpt-5.7\"\n\n[model.codex-user]\nmodel = \"mine\"\n",
+        "[model.codex]\nmodel = \"default\"\n\n[model.codex-gpt-5-7]\nmodel = \"gpt-5.7\"\n\n[model.codex-user]\nmodel = \"mine\"\n\n[models]\ndefault = \"codex-user\"\nweb_search = \"codex-gpt-5-7\"\n",
     )
     .expect("seed");
 
@@ -228,6 +245,8 @@ fn uninstall_removes_dynamic_managed_aliases_but_not_user_aliases() {
     assert!(!result.contains("[model.codex]"));
     assert!(!result.contains("[model.codex-gpt-5-7]"));
     assert!(result.contains("[model.codex-user]"));
+    assert!(result.contains("default = \"codex-user\""));
+    assert!(!result.contains("web_search"));
 }
 
 #[cfg(unix)]

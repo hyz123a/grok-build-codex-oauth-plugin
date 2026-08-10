@@ -98,10 +98,12 @@ impl CodexSseTransformer {
             .unwrap_or(0);
         match kind {
             "response.output_item.added" | "response.output_item.done" => {
-                if let Some(item) = event.get("item") {
+                let mut changed = false;
+                if let Some(item) = event.get_mut("item") {
+                    changed = ensure_web_search_action(item);
                     self.output_items.insert(output_index, item.clone());
                 }
-                false
+                changed
             }
             "response.output_text.delta" => {
                 if let Some(delta) = event.get("delta").and_then(Value::as_str) {
@@ -172,6 +174,29 @@ impl CodexSseTransformer {
             _ => false,
         }
     }
+}
+
+/// Grok's Responses decoder requires `action` on every web-search item, while
+/// Codex fills it only when the item is complete. Supply a harmless placeholder
+/// on the initial event; the later completed item replaces it with real data.
+fn ensure_web_search_action(item: &mut Value) -> bool {
+    let Some(object) = item.as_object_mut() else {
+        return false;
+    };
+    if object.get("type").and_then(Value::as_str) != Some("web_search_call")
+        || object.contains_key("action")
+    {
+        return false;
+    }
+    object.insert(
+        "action".into(),
+        serde_json::json!({
+            "type": "search",
+            "query": "",
+            "queries": []
+        }),
+    );
+    true
 }
 
 fn find_sse_delimiter(buffer: &[u8]) -> Option<(usize, usize)> {
@@ -312,6 +337,7 @@ pub fn transform_responses_request(
     object.remove("max_completion_tokens");
     object.remove("temperature");
     move_instruction_messages(object)?;
+    normalize_backend_search_tools(object);
 
     match object.get_mut("include") {
         Some(Value::Array(include)) => {
@@ -345,6 +371,23 @@ pub fn transform_responses_request(
     }
 
     Ok(request)
+}
+
+/// Grok names its hosted search tool `x_search`. The Codex Responses backend
+/// exposes the equivalent capability as `web_search` and rejects the xAI name.
+/// Rebuild the server-side tool instead of forwarding provider-specific fields.
+fn normalize_backend_search_tools(object: &mut serde_json::Map<String, Value>) {
+    let Some(tools) = object.get_mut("tools").and_then(Value::as_array_mut) else {
+        return;
+    };
+    for tool in tools {
+        let Some(tool_object) = tool.as_object_mut() else {
+            continue;
+        };
+        if tool_object.get("type").and_then(Value::as_str) == Some("x_search") {
+            *tool = serde_json::json!({"type": "web_search"});
+        }
+    }
 }
 
 /// Append proxy-owned instructions after client-provided instructions.

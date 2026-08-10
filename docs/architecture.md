@@ -6,7 +6,7 @@ Grok Responses client
         | POST /v1/responses + random local bearer credential
         v
 codex-proxy (127.0.0.1 only)
-        |-- codex-protocol: stateless/streaming JSON and safe headers
+        |-- codex-protocol: stateless/streaming JSON, backend web-search events, and safe headers
         |-- codex-oauth: keyring/file credentials and refresh
         |
         | HTTPS, OAuth bearer, ChatGPT account ID

@@ -13,6 +13,7 @@ use toml_edit::{Array, DocumentMut, InlineTable, Item, Table, Value, value};
 const GROK_REASONING_EFFORTS: &[&str] =
     &["none", "minimal", "low", "medium", "high", "xhigh", "max"];
 const DEFAULT_CONTEXT_WINDOW: i64 = 272_000;
+const PREFERRED_WEB_SEARCH_MODEL_ALIAS: &str = "codex-sol";
 
 pub const MANAGED_MODEL_ALIASES: &[&str] = &[
     "codex",
@@ -128,6 +129,9 @@ pub fn install_model(path: &Path, config: &ModelConfig) -> Result<(), ConfigErro
     codex["api_backend"] = value("responses");
     codex["api_key"] = value(&config.local_secret);
     codex["context_window"] = value(config.context_window);
+    codex["supports_backend_search"] = value(true);
+
+    configure_managed_web_search(&mut document, "codex", &["codex".into()])?;
 
     persist_if_changed(path, &original, &document.to_string())
 }
@@ -171,6 +175,17 @@ pub fn replace_model_catalog(
         upsert_model_table(models, selectable, config)?;
         installed.push(selectable.alias.clone());
     }
+    let web_search_alias = installed
+        .iter()
+        .find(|alias| alias.as_str() == PREFERRED_WEB_SEARCH_MODEL_ALIAS)
+        .or_else(|| installed.first())
+        .cloned();
+    if let Some(web_search_alias) = web_search_alias {
+        let mut managed_aliases = previously_managed.to_vec();
+        managed_aliases.extend(installed.iter().cloned());
+        managed_aliases.push("codex".into());
+        configure_managed_web_search(&mut document, &web_search_alias, &managed_aliases)?;
+    }
     persist_if_changed(path, &original, &document.to_string())?;
     Ok(installed)
 }
@@ -209,6 +224,20 @@ pub fn uninstall_model_aliases(path: &Path, aliases: &[String]) -> Result<(), Co
             document.remove("model");
         }
     }
+    let remove_web_search = document
+        .get("models")
+        .and_then(Item::as_table)
+        .and_then(|models| models.get("web_search"))
+        .and_then(Item::as_str)
+        .is_some_and(|alias| aliases.iter().any(|managed| managed == alias));
+    if remove_web_search
+        && let Some(models) = document.get_mut("models").and_then(Item::as_table_mut)
+    {
+        models.remove("web_search");
+        if models.is_empty() {
+            document.remove("models");
+        }
+    }
     persist_if_changed(path, &original, &document.to_string())
 }
 
@@ -230,11 +259,31 @@ fn upsert_model_table(
     entry["api_backend"] = value("responses");
     entry["api_key"] = value(&config.local_secret);
     entry["context_window"] = value(selectable.context_window.unwrap_or(config.context_window));
+    entry["supports_backend_search"] = value(true);
     write_reasoning_config(
         entry,
         selectable.default_reasoning_effort.as_deref(),
         &selectable.supported_reasoning_efforts,
     );
+    Ok(())
+}
+
+fn configure_managed_web_search(
+    document: &mut DocumentMut,
+    preferred_alias: &str,
+    managed_aliases: &[String],
+) -> Result<(), ConfigError> {
+    ensure_table(document, "models")?;
+    let models = document["models"]
+        .as_table_mut()
+        .ok_or(ConfigError::ConflictingValue("models"))?;
+    let may_manage = models
+        .get("web_search")
+        .and_then(Item::as_str)
+        .is_none_or(|current| managed_aliases.iter().any(|alias| alias == current));
+    if may_manage {
+        models["web_search"] = value(preferred_alias);
+    }
     Ok(())
 }
 
