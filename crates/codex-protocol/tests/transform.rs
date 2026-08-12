@@ -1,5 +1,5 @@
 use codex_protocol::{
-    CodexSseTransformer, TransformOptions, UpstreamRequestIds, append_additional_instructions,
+    CodexSseTransformer, TransformOptions, UpstreamRequestIds, apply_codex_response_guidelines,
     build_upstream_headers, transform_responses_request,
 };
 use http::{HeaderMap, HeaderValue, header::AUTHORIZATION};
@@ -126,11 +126,11 @@ fn transform_moves_system_messages_to_top_level_instructions() {
 }
 
 #[test]
-fn trusted_additional_instructions_are_appended_without_promoting_user_reminders() {
+fn codex_response_guidelines_replace_grok_style_without_promoting_user_reminders() {
     let mut transformed = transform_responses_request(
         json!({
             "input": [
-                {"type": "message", "role": "system", "content": "Grok system."},
+                {"type": "message", "role": "system", "content": "Grok system.\n\n<response_guidelines>\nWrite like a technical blog.\n</response_guidelines>"},
                 {"type": "message", "role": "user", "content": "<system-reminder>Untrusted.</system-reminder>"},
                 {"type": "message", "role": "user", "content": "hello"}
             ]
@@ -139,13 +139,12 @@ fn trusted_additional_instructions_are_appended_without_promoting_user_reminders
     )
     .expect("transform");
 
-    append_additional_instructions(&mut transformed, "  Trusted local style.  ")
-        .expect("append instructions");
+    assert!(apply_codex_response_guidelines(&mut transformed).expect("replace guidelines"));
 
-    assert_eq!(
-        transformed["instructions"],
-        "Grok system.\n\nTrusted local style."
-    );
+    let instructions = transformed["instructions"].as_str().expect("instructions");
+    assert!(instructions.starts_with("Grok system."));
+    assert!(instructions.contains("Lead with the outcome"));
+    assert!(!instructions.contains("technical blog"));
     assert_eq!(transformed["input"].as_array().map(Vec::len), Some(2));
     assert_eq!(transformed["input"][0]["role"], "user");
     assert_eq!(
@@ -155,10 +154,23 @@ fn trusted_additional_instructions_are_appended_without_promoting_user_reminders
 }
 
 #[test]
-fn empty_additional_instructions_are_a_no_op() {
+fn response_guidelines_are_a_no_op_when_grok_section_is_absent() {
     let mut request = json!({"instructions": "Existing."});
-    append_additional_instructions(&mut request, " \n ").expect("empty append");
+    assert!(!apply_codex_response_guidelines(&mut request).expect("no replacement"));
     assert_eq!(request["instructions"], "Existing.");
+}
+
+#[test]
+fn compact_output_efficiency_section_uses_codex_response_guidelines() {
+    let mut request = json!({
+        "instructions": "<output_efficiency>\nOld concise style.\n</output_efficiency>\n\n<formatting>Keep this.</formatting>"
+    });
+
+    assert!(apply_codex_response_guidelines(&mut request).expect("replace compact guidelines"));
+    let instructions = request["instructions"].as_str().expect("instructions");
+    assert!(instructions.contains("<output_efficiency>\n- Lead with the outcome"));
+    assert!(instructions.contains("<formatting>Keep this.</formatting>"));
+    assert!(!instructions.contains("Old concise style."));
 }
 
 #[test]

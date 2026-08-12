@@ -17,6 +17,7 @@ codex-oauth = { path = "../codex-oauth" }
 codex-models = { path = "../codex-models" }
 codex-proxy = { path = "../codex-proxy" }
 directories.workspace = true
+fs2.workspace = true
 grok-config = { path = "../grok-config" }
 rand.workspace = true
 reqwest.workspace = true

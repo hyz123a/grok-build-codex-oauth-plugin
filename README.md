@@ -19,7 +19,7 @@ stable API. For production or multi-user systems, use the OpenAI Platform API in
 - Filtering of backend-only JSON `keepalive` events that Grok's Responses decoder cannot accept
 - Expiry-window refresh plus one refresh/retry after an upstream `401`
 - Usage-limit error normalization, per-session prompt caching, and model-aware reasoning clamps
-- Private, proxy-owned additional instructions that remain separate from user messages
+- Grok system-prompt response guidelines rewritten to Codex-style communication at the proxy boundary
 - Account-aware Codex model discovery with private local cache and built-in offline fallback
 - Idempotent, scoped edits to managed `[model.codex*]` entries with a config backup
 - Grok skills and a `SessionStart` daemon hook
@@ -92,12 +92,15 @@ logs                   Show or follow proxy diagnostic logs
 are never written into Grok configuration, environment variables, command arguments, or normal
 logs.
 
-`setup` also creates `~/.grok/codex-oauth/additional-instructions.md` with a concise Codex-style
-communication policy. The proxy reads this private regular file at startup and appends it to the
-top-level Responses `instructions`; it never promotes `<system-reminder>` or other user-message
-content. Existing edits to the file are preserved by later `setup` runs. Run
-`grok-codex-oauth ensure-daemon` after editing it so the instruction fingerprint is checked and the
-daemon is restarted when needed. An empty file disables the additional instructions.
+The proxy preserves Grok's rendered system prompt, including its tools, permissions, safety rules,
+and agent loop, but replaces the `<response_guidelines>` section with the Codex-style policy stored
+in `crates/codex-protocol/assets/codex-response-guidelines.md`. Grok's compact
+`<output_efficiency>` variant is handled the same way. During compilation, `codex-protocol` fetches
+the current template from Grok Build's `main` branch, verifies the expected section, and generates
+the modified template in Cargo's `OUT_DIR`. Set `GROK_BUILD_PROMPT_REV` to a commit SHA for a
+reproducible build. The build fails explicitly when the template cannot be downloaded or no longer
+contains the expected section. The legacy `~/.grok/codex-oauth/additional-instructions.md` file is
+no longer created or read.
 
 `setup` marks the managed Codex model entries as backend-search capable and, when no explicit
 non-Codex search model is configured, sets `[models].web_search` to `codex-sol`. Search requests

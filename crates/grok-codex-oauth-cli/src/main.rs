@@ -1,3 +1,5 @@
+#[cfg(target_os = "linux")]
+use std::os::unix::ffi::OsStrExt;
 use std::{
     collections::{HashMap, VecDeque},
     fs,
@@ -26,10 +28,11 @@ use codex_oauth::{
     build_authorize_url, generate_state, validate_callback,
 };
 use codex_proxy::{
-    CredentialProvider, ProxyConfig, StoredCredentialProvider, additional_instructions_fingerprint,
-    build_router, websocket_proxy_configured_from_env,
+    CredentialProvider, ProxyConfig, StoredCredentialProvider, build_router,
+    system_prompt_policy_fingerprint, websocket_proxy_configured_from_env,
 };
 use directories::BaseDirs;
+use fs2::FileExt;
 use grok_config::{
     BUILTIN_CODEX_MODEL_CATALOG, MANAGED_MODEL_ALIASES, ModelConfig, SelectableModel,
     install_model_catalog, read_model_config, replace_model_catalog, uninstall_model_aliases,
@@ -44,8 +47,9 @@ const FALLBACK_CODEX_CLIENT_VERSION: &str = "0.145.0";
 const DEFAULT_LOG_LINES: usize = 100;
 const MAX_DAEMON_LOG_BYTES: u64 = 10 * 1024 * 1024;
 const DAEMON_LOG_BACKUPS: usize = 3;
-const MAX_ADDITIONAL_INSTRUCTIONS_BYTES: u64 = 16 * 1024;
-const DEFAULT_ADDITIONAL_INSTRUCTIONS: &str = include_str!("../assets/codex-style-instructions.md");
+const DAEMON_STOP_GRACE_PERIOD: Duration = Duration::from_secs(5);
+const DAEMON_KILL_WAIT: Duration = Duration::from_secs(2);
+const DAEMON_PROCESS_POLL_INTERVAL: Duration = Duration::from_millis(50);
 
 #[derive(Parser)]
 #[command(version, about = "ChatGPT/Codex OAuth companion for Grok Build")]
@@ -221,7 +225,6 @@ struct AppPaths {
     daemon_log: PathBuf,
     grok_config: PathBuf,
     models_cache: PathBuf,
-    additional_instructions: PathBuf,
 }
 
 impl AppPaths {
@@ -236,7 +239,6 @@ impl AppPaths {
             daemon_log: data_dir.join("daemon.log"),
             grok_config: grok_dir.join("config.toml"),
             models_cache: data_dir.join("models-cache.json"),
-            additional_instructions: data_dir.join("additional-instructions.md"),
             data_dir,
         })
     }
@@ -486,12 +488,6 @@ fn setup(paths: &AppPaths, model: &str, port: u16) -> Result<()> {
             generated
         }
     };
-    if !paths.additional_instructions.exists() {
-        write_private_file(
-            &paths.additional_instructions,
-            DEFAULT_ADDITIONAL_INSTRUCTIONS.as_bytes(),
-        )?;
-    }
     install_model_catalog(&paths.grok_config, &ModelConfig::new(model, port, secret))?;
     println!("Configured selectable Codex models at http://127.0.0.1:{port}/v1.");
     Ok(())
@@ -526,9 +522,6 @@ async fn serve(paths: &AppPaths, port: u16) -> Result<()> {
         .map(|(_, model, _)| (*model).to_string())
         .collect::<Vec<_>>();
     let mut proxy_config = ProxyConfig::production(secret)?.with_websocket_proxy_from_env()?;
-    if let Some(instructions) = load_additional_instructions(&paths.additional_instructions)? {
-        proxy_config = proxy_config.with_additional_instructions(instructions);
-    }
     match load_cached_catalog(&paths.models_cache) {
         Ok(Some(models)) => {
             for model in models {
@@ -585,28 +578,36 @@ async fn shutdown_signal() {
 
 async fn ensure_daemon(paths: &AppPaths, port: u16) -> Result<()> {
     let expected_websocket_proxy = websocket_proxy_configured_from_env()?;
-    let instructions = load_additional_instructions(&paths.additional_instructions)?;
-    let expected_instructions_fingerprint =
-        additional_instructions_fingerprint(instructions.as_deref());
+    let expected_system_prompt_policy_fingerprint = system_prompt_policy_fingerprint();
     if let Some(active) = health_status(port).await {
-        if active.websocket_proxy == expected_websocket_proxy
-            && active.additional_instructions_fingerprint == expected_instructions_fingerprint
-        {
+        if daemon_configuration_matches(
+            &active,
+            expected_websocket_proxy,
+            &expected_system_prompt_policy_fingerprint,
+        ) {
             return Ok(());
         }
         tracing::info!(
             active_websocket_proxy = active.websocket_proxy,
             expected_websocket_proxy,
-            instructions_changed =
-                active.additional_instructions_fingerprint != expected_instructions_fingerprint,
+            system_prompt_policy_changed = active.system_prompt_policy_fingerprint
+                != expected_system_prompt_policy_fingerprint,
             "Restarting Codex OAuth daemon because runtime configuration changed"
         );
         stop_daemon(paths)?;
+        let mut stopped = false;
         for _ in 0..40 {
             if health_status(port).await.is_none() {
+                stopped = true;
                 break;
             }
             tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        if !stopped {
+            bail!(
+                "daemon is still listening on port {port} after the stop attempt; inspect {}",
+                paths.daemon_log.display()
+            )
         }
     }
     if paths.store().load().await?.is_none() {
@@ -618,7 +619,50 @@ async fn ensure_daemon(paths: &AppPaths, port: u16) -> Result<()> {
         return Ok(());
     }
     fs::create_dir_all(&paths.data_dir)?;
-    Command::new(std::env::current_exe()?)
+    spawn_daemon(paths, port)?;
+    for _ in 0..40 {
+        if let Some(active) = health_status(port).await
+            && daemon_configuration_matches(
+                &active,
+                expected_websocket_proxy,
+                &expected_system_prompt_policy_fingerprint,
+            )
+        {
+            return Ok(());
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    bail!(
+        "daemon did not become healthy; inspect {}",
+        paths.daemon_log.display()
+    )
+}
+
+fn spawn_daemon(paths: &AppPaths, port: u16) -> Result<()> {
+    let executable = std::env::current_exe()?;
+    #[cfg(target_os = "linux")]
+    let mut command = {
+        let mut command = Command::new("setsid");
+        command.arg("--fork").arg(executable);
+        command
+    };
+    #[cfg(all(unix, not(target_os = "linux")))]
+    let mut command = {
+        use std::os::unix::process::CommandExt;
+        let mut command = Command::new(executable);
+        command.process_group(0);
+        command
+    };
+    #[cfg(windows)]
+    let mut command = {
+        use std::os::windows::process::CommandExt;
+        const DETACHED_PROCESS: u32 = 0x0000_0008;
+        const CREATE_NEW_PROCESS_GROUP: u32 = 0x0000_0200;
+        let mut command = Command::new(executable);
+        command.creation_flags(DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP);
+        command
+    };
+    command
         .arg("serve")
         .arg("--port")
         .arg(port.to_string())
@@ -628,17 +672,17 @@ async fn ensure_daemon(paths: &AppPaths, port: u16) -> Result<()> {
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .spawn()
-        .context("failed to start Codex OAuth daemon")?;
-    for _ in 0..40 {
-        if health(port).await {
-            return Ok(());
-        }
-        tokio::time::sleep(Duration::from_millis(50)).await;
-    }
-    bail!(
-        "daemon did not become healthy; inspect {}",
-        paths.daemon_log.display()
-    )
+        .context("failed to start detached Codex OAuth daemon")?;
+    Ok(())
+}
+
+fn daemon_configuration_matches(
+    active: &DaemonHealth,
+    expected_websocket_proxy: bool,
+    expected_system_prompt_policy_fingerprint: &str,
+) -> bool {
+    active.websocket_proxy == expected_websocket_proxy
+        && active.system_prompt_policy_fingerprint == expected_system_prompt_policy_fingerprint
 }
 
 fn logs(
@@ -935,7 +979,7 @@ async fn health(port: u16) -> bool {
 #[derive(Debug, PartialEq, Eq)]
 struct DaemonHealth {
     websocket_proxy: bool,
-    additional_instructions_fingerprint: Option<String>,
+    system_prompt_policy_fingerprint: String,
 }
 
 async fn health_status(port: u16) -> Option<DaemonHealth> {
@@ -954,50 +998,12 @@ async fn health_status(port: u16) -> Option<DaemonHealth> {
             .get("websocket_proxy")
             .and_then(serde_json::Value::as_bool)
             .unwrap_or(false),
-        additional_instructions_fingerprint: body
-            .get("additional_instructions_fingerprint")
+        system_prompt_policy_fingerprint: body
+            .get("system_prompt_policy_fingerprint")
             .and_then(serde_json::Value::as_str)
-            .map(str::to_owned),
+            .unwrap_or_default()
+            .to_owned(),
     })
-}
-
-fn load_additional_instructions(path: &Path) -> Result<Option<String>> {
-    let metadata = match fs::symlink_metadata(path) {
-        Ok(metadata) => metadata,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-        Err(error) => return Err(error.into()),
-    };
-    if !metadata.file_type().is_file() {
-        bail!(
-            "additional instructions must be a regular file: {}",
-            path.display()
-        );
-    }
-    if metadata.len() > MAX_ADDITIONAL_INSTRUCTIONS_BYTES {
-        bail!(
-            "additional instructions exceed {} bytes: {}",
-            MAX_ADDITIONAL_INSTRUCTIONS_BYTES,
-            path.display()
-        );
-    }
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        if metadata.permissions().mode() & 0o077 != 0 {
-            bail!(
-                "additional instructions must not be accessible by group or other users: {}",
-                path.display()
-            );
-        }
-    }
-    let instructions = fs::read_to_string(path).with_context(|| {
-        format!(
-            "could not read additional instructions at {}",
-            path.display()
-        )
-    })?;
-    let instructions = instructions.trim();
-    Ok((!instructions.is_empty()).then(|| instructions.to_owned()))
 }
 
 fn read_secret(paths: &AppPaths) -> Result<String> {
@@ -1015,37 +1021,166 @@ fn stop_daemon(paths: &AppPaths) -> Result<()> {
         return Ok(());
     };
     let pid = pid.trim();
-    if !pid.chars().all(|character| character.is_ascii_digit()) {
+    if pid.is_empty() || !pid.chars().all(|character| character.is_ascii_digit()) {
         bail!("daemon PID file is invalid")
     }
+    if !is_managed_daemon_process(pid)? {
+        tracing::warn!(pid, "Ignoring stale daemon PID file");
+        remove_pid_file_if_owned(&paths.daemon_pid, pid);
+        return Ok(());
+    }
     #[cfg(unix)]
-    let status = Command::new("kill").arg("-TERM").arg(pid).status()?;
+    let status = Command::new("kill")
+        .arg("-TERM")
+        .arg(pid)
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()?;
     #[cfg(windows)]
     let status = Command::new("taskkill").args(["/PID", pid]).status()?;
-    if !status.success() {
-        tracing::warn!("daemon process was not running");
+    if !status.success() && process_exists(pid) {
+        bail!("could not stop daemon process {pid}")
     }
-    let _ = fs::remove_file(&paths.daemon_pid);
+    if !wait_for_process_exit(pid, DAEMON_STOP_GRACE_PERIOD) {
+        tracing::warn!(pid, "Daemon did not stop gracefully; terminating it");
+        #[cfg(unix)]
+        let status = Command::new("kill")
+            .arg("-KILL")
+            .arg(pid)
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()?;
+        #[cfg(windows)]
+        let status = Command::new("taskkill")
+            .args(["/F", "/PID", pid])
+            .status()?;
+        if (!status.success() && process_exists(pid))
+            || !wait_for_process_exit(pid, DAEMON_KILL_WAIT)
+        {
+            bail!("daemon process {pid} did not exit")
+        }
+    }
+    remove_pid_file_if_owned(&paths.daemon_pid, pid);
     Ok(())
 }
 
+#[derive(Debug)]
 struct PidGuard {
     path: PathBuf,
+    pid: String,
+    _lock: fs::File,
 }
 
 impl PidGuard {
     fn create(path: &Path) -> Result<Self> {
-        write_private_file(path, std::process::id().to_string().as_bytes())?;
+        let lock_path = path.with_extension("lock");
+        let parent = lock_path
+            .parent()
+            .ok_or_else(|| anyhow!("daemon lock path has no parent"))?;
+        fs::create_dir_all(parent)?;
+        let mut options = fs::OpenOptions::new();
+        options.read(true).write(true).create(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
+        }
+        let lock = options.open(&lock_path)?;
+        FileExt::try_lock_exclusive(&lock)
+            .with_context(|| "another Codex OAuth daemon is already running")?;
+        let pid = std::process::id().to_string();
+        write_private_file(path, pid.as_bytes())?;
         Ok(Self {
             path: path.to_owned(),
+            pid,
+            _lock: lock,
         })
     }
 }
 
 impl Drop for PidGuard {
     fn drop(&mut self) {
-        let _ = fs::remove_file(&self.path);
+        remove_pid_file_if_owned(&self.path, &self.pid);
     }
+}
+
+fn remove_pid_file_if_owned(path: &Path, expected_pid: &str) {
+    if fs::read_to_string(path).is_ok_and(|pid| pid.trim() == expected_pid) {
+        let _ = fs::remove_file(path);
+    }
+}
+
+fn wait_for_process_exit(pid: &str, timeout: Duration) -> bool {
+    let deadline = std::time::Instant::now() + timeout;
+    while process_exists(pid) {
+        if std::time::Instant::now() >= deadline {
+            return false;
+        }
+        std::thread::sleep(DAEMON_PROCESS_POLL_INTERVAL);
+    }
+    true
+}
+
+#[cfg(unix)]
+fn process_exists(pid: &str) -> bool {
+    Command::new("kill")
+        .arg("-0")
+        .arg(pid)
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .is_ok_and(|status| status.success())
+}
+
+#[cfg(windows)]
+fn process_exists(pid: &str) -> bool {
+    Command::new("tasklist")
+        .args(["/FI", &format!("PID eq {pid}"), "/NH"])
+        .output()
+        .is_ok_and(|output| {
+            output.status.success() && String::from_utf8_lossy(&output.stdout).contains(pid)
+        })
+}
+
+#[cfg(target_os = "linux")]
+fn is_managed_daemon_process(pid: &str) -> Result<bool> {
+    let command_line = match fs::read(format!("/proc/{pid}/cmdline")) {
+        Ok(command_line) => command_line,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(error) => return Err(error.into()),
+    };
+    let arguments = command_line
+        .split(|byte| *byte == 0)
+        .filter(|argument| !argument.is_empty())
+        .collect::<Vec<_>>();
+    let executable_matches = arguments.first().is_some_and(|argument| {
+        Path::new(std::ffi::OsStr::from_bytes(argument))
+            .file_name()
+            .is_some_and(|name| name == "grok-codex-oauth")
+    });
+    Ok(executable_matches && arguments.iter().any(|argument| *argument == b"serve"))
+}
+
+#[cfg(all(unix, not(target_os = "linux")))]
+fn is_managed_daemon_process(pid: &str) -> Result<bool> {
+    let output = Command::new("ps")
+        .args(["-p", pid, "-o", "command="])
+        .output()?;
+    let command = String::from_utf8_lossy(&output.stdout);
+    Ok(output.status.success()
+        && command.contains("grok-codex-oauth")
+        && command
+            .split_whitespace()
+            .any(|argument| argument == "serve"))
+}
+
+#[cfg(windows)]
+fn is_managed_daemon_process(pid: &str) -> Result<bool> {
+    let output = Command::new("tasklist")
+        .args(["/FI", &format!("PID eq {pid}"), "/NH"])
+        .output()?;
+    Ok(output.status.success()
+        && String::from_utf8_lossy(&output.stdout).contains("grok-codex-oauth.exe"))
 }
 
 fn write_private_file(path: &Path, contents: &[u8]) -> Result<()> {
@@ -1088,21 +1223,6 @@ fn check(value: bool) -> &'static str {
 mod tests {
     use super::*;
 
-    fn test_paths(root: &Path) -> AppPaths {
-        let grok_dir = root.join(".grok");
-        let data_dir = grok_dir.join("codex-oauth");
-        AppPaths {
-            credentials: data_dir.join("credentials.json"),
-            proxy_secret: data_dir.join("proxy-secret"),
-            daemon_pid: data_dir.join("daemon.pid"),
-            daemon_log: data_dir.join("daemon.log"),
-            grok_config: grok_dir.join("config.toml"),
-            models_cache: data_dir.join("models-cache.json"),
-            additional_instructions: data_dir.join("additional-instructions.md"),
-            data_dir,
-        }
-    }
-
     #[test]
     fn models_sync_is_a_supported_command() {
         let cli =
@@ -1113,67 +1233,6 @@ mod tests {
                 command: ModelsCommand::Sync
             }
         ));
-    }
-
-    #[test]
-    fn setup_installs_private_default_instructions_without_overwriting_custom_content() {
-        let directory = tempfile::tempdir().expect("tempdir");
-        let paths = test_paths(directory.path());
-
-        setup(&paths, "gpt-5.6-sol", 1456).expect("initial setup");
-        assert_eq!(
-            fs::read_to_string(&paths.additional_instructions).expect("read default"),
-            DEFAULT_ADDITIONAL_INSTRUCTIONS
-        );
-
-        write_private_file(&paths.additional_instructions, b"Custom local style.\n")
-            .expect("customize instructions");
-        setup(&paths, "gpt-5.6-sol", 1456).expect("repeat setup");
-        assert_eq!(
-            fs::read_to_string(&paths.additional_instructions).expect("read custom"),
-            "Custom local style.\n"
-        );
-    }
-
-    #[test]
-    fn additional_instructions_loader_trims_private_regular_files() {
-        let directory = tempfile::tempdir().expect("tempdir");
-        let path = directory.path().join("instructions.md");
-        write_private_file(&path, b"\n Trusted local style. \n").expect("write instructions");
-
-        assert_eq!(
-            load_additional_instructions(&path).expect("load instructions"),
-            Some("Trusted local style.".into())
-        );
-    }
-
-    #[test]
-    fn additional_instructions_loader_rejects_oversized_files() {
-        let directory = tempfile::tempdir().expect("tempdir");
-        let path = directory.path().join("instructions.md");
-        write_private_file(
-            &path,
-            &vec![b'x'; MAX_ADDITIONAL_INSTRUCTIONS_BYTES as usize + 1],
-        )
-        .expect("write oversized instructions");
-
-        assert!(load_additional_instructions(&path).is_err());
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn additional_instructions_loader_rejects_symlinks_and_open_permissions() {
-        use std::os::unix::fs::{PermissionsExt, symlink};
-
-        let directory = tempfile::tempdir().expect("tempdir");
-        let target = directory.path().join("target.md");
-        let link = directory.path().join("link.md");
-        write_private_file(&target, b"Trusted local style.").expect("write target");
-        symlink(&target, &link).expect("create symlink");
-        assert!(load_additional_instructions(&link).is_err());
-
-        fs::set_permissions(&target, fs::Permissions::from_mode(0o644)).expect("open permissions");
-        assert!(load_additional_instructions(&target).is_err());
     }
 
     #[test]
@@ -1287,6 +1346,70 @@ mod tests {
             Some("0.145.0".into())
         );
         assert_eq!(parse_codex_version("unexpected output"), None);
+    }
+
+    #[test]
+    fn pid_guard_does_not_remove_a_replaced_pid_file() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let path = directory.path().join("daemon.pid");
+        let guard = PidGuard::create(&path).expect("create PID guard");
+
+        fs::write(&path, "987654").expect("replace PID file");
+        drop(guard);
+
+        assert_eq!(fs::read_to_string(path).expect("read PID file"), "987654");
+    }
+
+    #[test]
+    fn pid_guard_prevents_two_daemons_from_owning_the_same_pid_file() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let path = directory.path().join("daemon.pid");
+        let first = PidGuard::create(&path).expect("create first PID guard");
+
+        let error = PidGuard::create(&path).expect_err("reject second PID guard");
+        assert!(
+            error
+                .to_string()
+                .contains("another Codex OAuth daemon is already running")
+        );
+
+        drop(first);
+        let replacement = PidGuard::create(&path).expect("create replacement PID guard");
+        drop(replacement);
+        assert!(!path.exists());
+    }
+
+    #[test]
+    fn pid_file_is_only_removed_for_its_current_owner() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let path = directory.path().join("daemon.pid");
+        fs::write(&path, "123").expect("write PID file");
+
+        remove_pid_file_if_owned(&path, "456");
+        assert!(path.exists());
+
+        remove_pid_file_if_owned(&path, "123");
+        assert!(!path.exists());
+    }
+
+    #[test]
+    fn daemon_health_only_matches_the_expected_runtime_configuration() {
+        let active = DaemonHealth {
+            websocket_proxy: false,
+            system_prompt_policy_fingerprint: "current-policy".into(),
+        };
+
+        assert!(daemon_configuration_matches(
+            &active,
+            false,
+            "current-policy"
+        ));
+        assert!(!daemon_configuration_matches(
+            &active,
+            true,
+            "current-policy"
+        ));
+        assert!(!daemon_configuration_matches(&active, false, "old-policy"));
     }
 
     #[test]

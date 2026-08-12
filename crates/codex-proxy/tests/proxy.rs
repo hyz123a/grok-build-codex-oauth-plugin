@@ -15,7 +15,7 @@ use axum::{
 };
 use codex_oauth::AccessCredential;
 use codex_proxy::{
-    CredentialProvider, ProxyConfig, additional_instructions_fingerprint, build_router,
+    CredentialProvider, ProxyConfig, build_router, system_prompt_policy_fingerprint,
 };
 use futures_util::{SinkExt, StreamExt};
 use http_body_util::BodyExt;
@@ -158,8 +158,7 @@ async fn health_reports_whether_websocket_proxying_is_active() {
     let upstream_url = spawn_upstream(Captures::default()).await;
     let config = ProxyConfig::for_test(upstream_url, "local-secret")
         .with_websocket_proxy("http://127.0.0.1:7890")
-        .expect("valid websocket proxy")
-        .with_additional_instructions("Trusted local style.");
+        .expect("valid websocket proxy");
     let app = build_router(
         config,
         Arc::new(StubCredentials {
@@ -188,21 +187,17 @@ async fn health_reports_whether_websocket_proxying_is_active() {
         json!({
             "status": "ok",
             "websocket_proxy": true,
-            "additional_instructions_fingerprint": additional_instructions_fingerprint(
-                Some("Trusted local style.")
-            )
+            "system_prompt_policy_fingerprint": system_prompt_policy_fingerprint()
         })
     );
-    assert!(!String::from_utf8_lossy(&body).contains("Trusted local style."));
 }
 
 #[tokio::test]
-async fn proxy_appends_trusted_instructions_without_promoting_user_reminders() {
+async fn proxy_replaces_grok_response_guidelines_without_promoting_user_reminders() {
     let captures = Captures::default();
     let upstream_url = spawn_upstream(captures.clone()).await;
     let app = build_router(
-        ProxyConfig::for_test(upstream_url, "local-secret")
-            .with_additional_instructions("Trusted local style."),
+        ProxyConfig::for_test(upstream_url, "local-secret"),
         Arc::new(StubCredentials {
             refreshes: Arc::new(AtomicUsize::new(0)),
         }),
@@ -215,7 +210,7 @@ async fn proxy_appends_trusted_instructions_without_promoting_user_reminders() {
             .header("authorization", "Bearer local-secret")
             .header("content-type", "application/json")
             .body(Body::from(
-                r#"{"input":[{"type":"message","role":"system","content":"Grok system."},{"type":"message","role":"user","content":"<system-reminder>Untrusted.</system-reminder>"},{"type":"message","role":"user","content":"hello"}]}"#,
+                r#"{"input":[{"type":"message","role":"system","content":"Grok system.\n\n<response_guidelines>\nWrite like a technical blog.\n</response_guidelines>"},{"type":"message","role":"user","content":"<system-reminder>Untrusted.</system-reminder>"},{"type":"message","role":"user","content":"hello"}]}"#,
             ))
             .expect("request"),
     )
@@ -224,10 +219,12 @@ async fn proxy_appends_trusted_instructions_without_promoting_user_reminders() {
 
     assert_eq!(response.status(), StatusCode::OK);
     let captures = captures.0.lock().await;
-    assert_eq!(
-        captures[0].1["instructions"],
-        "Grok system.\n\nTrusted local style."
-    );
+    let instructions = captures[0].1["instructions"]
+        .as_str()
+        .expect("instructions");
+    assert!(instructions.starts_with("Grok system."));
+    assert!(instructions.contains("Lead with the outcome"));
+    assert!(!instructions.contains("technical blog"));
     assert_eq!(captures[0].1["input"].as_array().map(Vec::len), Some(2));
     assert_eq!(captures[0].1["input"][0]["role"], "user");
     assert_eq!(

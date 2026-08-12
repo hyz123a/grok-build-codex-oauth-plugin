@@ -14,6 +14,8 @@ use serde_json::Value;
 use thiserror::Error;
 
 pub const DEFAULT_ORIGINATOR: &str = "grok-build";
+pub const GROK_CODEX_SYSTEM_PROMPT_TEMPLATE: &str =
+    include_str!(concat!(env!("OUT_DIR"), "/grok-system-prompt.md"));
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct UpstreamRequestIds {
@@ -390,35 +392,52 @@ fn normalize_backend_search_tools(object: &mut serde_json::Map<String, Value>) {
     }
 }
 
-/// Append proxy-owned instructions after client-provided instructions.
-///
-/// This intentionally does not inspect or promote user messages. The caller is
-/// responsible for sourcing `additional` from a trusted local configuration.
-pub fn append_additional_instructions(
-    request: &mut Value,
-    additional: &str,
-) -> Result<(), ProtocolError> {
-    let additional = additional.trim();
-    if additional.is_empty() {
-        return Ok(());
-    }
+/// Replace Grok's response-style section while retaining its rendered tool,
+/// execution, safety, and environment guidance.
+pub fn apply_codex_response_guidelines(request: &mut Value) -> Result<bool, ProtocolError> {
     let object = request
         .as_object_mut()
         .ok_or(ProtocolError::RequestMustBeObject)?;
-    match object.get_mut("instructions") {
-        Some(Value::String(existing)) if existing.trim().is_empty() => {
-            *existing = additional.to_owned();
-        }
-        Some(Value::String(existing)) => {
-            existing.push_str("\n\n");
-            existing.push_str(additional);
-        }
-        Some(Value::Null) | None => {
-            object.insert("instructions".into(), Value::String(additional.to_owned()));
-        }
-        Some(_) => return Err(ProtocolError::InstructionsMustBeString),
-    }
-    Ok(())
+    let Some(instructions) = object.get_mut("instructions") else {
+        return Ok(false);
+    };
+    let instructions = instructions
+        .as_str()
+        .ok_or(ProtocolError::InstructionsMustBeString)?;
+    let replacement = tagged_section(GROK_CODEX_SYSTEM_PROMPT_TEMPLATE, "response_guidelines")
+        .expect("generated Grok prompt must contain response_guidelines");
+
+    let replaced = replace_tagged_section(instructions, "response_guidelines", replacement)
+        .or_else(|| replace_tagged_section(instructions, "output_efficiency", replacement));
+    let Some(replaced) = replaced else {
+        return Ok(false);
+    };
+    object.insert("instructions".into(), Value::String(replaced));
+    Ok(true)
+}
+
+fn tagged_section<'a>(text: &'a str, tag: &str) -> Option<&'a str> {
+    let start_tag = format!("<{tag}>");
+    let end_tag = format!("</{tag}>");
+    let start = text.find(&start_tag)? + start_tag.len();
+    let end = text[start..].find(&end_tag)? + start;
+    Some(text[start..end].trim())
+}
+
+fn replace_tagged_section(text: &str, tag: &str, replacement: &str) -> Option<String> {
+    let start_tag = format!("<{tag}>");
+    let end_tag = format!("</{tag}>");
+    let start = text.find(&start_tag)?;
+    let content_start = start + start_tag.len();
+    let end = text[content_start..].find(&end_tag)? + content_start;
+    Some(format!(
+        "{}{}\n{}\n{}{}",
+        &text[..start],
+        start_tag,
+        replacement,
+        end_tag,
+        &text[end + end_tag.len()..]
+    ))
 }
 
 fn move_instruction_messages(
