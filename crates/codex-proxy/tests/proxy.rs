@@ -516,7 +516,10 @@ async fn spawn_refreshing_websocket_upstream(attempts: Arc<AtomicUsize>) -> Stri
 }
 
 #[allow(clippy::result_large_err)]
-async fn spawn_previous_missing_websocket_upstream(captures: ReuseWebSocketCaptures) -> String {
+async fn spawn_incremental_retry_websocket_upstream(
+    captures: ReuseWebSocketCaptures,
+    retry_event: Value,
+) -> String {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
         .await
         .expect("bind previous-missing websocket");
@@ -562,20 +565,23 @@ async fn spawn_previous_missing_websocket_upstream(captures: ReuseWebSocketCaptu
                         }]
                     }
                 }),
-                2 => json!({
-                    "type": "error",
-                    "error": {
-                        "type": "invalid_request_error",
-                        "code": "previous_response_not_found",
-                        "message": "retry the full request"
-                    }
-                }),
+                2 => retry_event.clone(),
                 _ => json!({
                     "type": "response.completed",
                     "response": {
                         "id": "resp-retried",
                         "status": "completed",
-                        "output": []
+                        "output": [{
+                            "type": "message",
+                            "id": "msg-retried",
+                            "role": "assistant",
+                            "status": "completed",
+                            "content": [{
+                                "type": "output_text",
+                                "text": "retried",
+                                "annotations": []
+                            }]
+                        }]
                     }
                 }),
             };
@@ -1157,7 +1163,18 @@ async fn previous_response_not_found_retries_once_with_the_full_request() {
     let http_captures = Captures::default();
     let http_url = spawn_upstream(http_captures.clone()).await;
     let websocket_captures = ReuseWebSocketCaptures::default();
-    let websocket_url = spawn_previous_missing_websocket_upstream(websocket_captures.clone()).await;
+    let websocket_url = spawn_incremental_retry_websocket_upstream(
+        websocket_captures.clone(),
+        json!({
+            "type": "error",
+            "error": {
+                "type": "invalid_request_error",
+                "code": "previous_response_not_found",
+                "message": "retry the full request"
+            }
+        }),
+    )
+    .await;
     let app = build_router(
         ProxyConfig::for_test(http_url, "local-secret").with_websocket_upstream(websocket_url),
         Arc::new(StubCredentials {
@@ -1211,6 +1228,88 @@ async fn previous_response_not_found_retries_once_with_the_full_request() {
                 .windows("previous_response_not_found".len())
                 .any(|part| { part == b"previous_response_not_found" })
         );
+    }
+
+    assert_eq!(websocket_captures.connections.load(Ordering::SeqCst), 1);
+    let requests = websocket_captures.requests.lock().await;
+    assert_eq!(requests.len(), 3);
+    assert_eq!(requests[1]["previous_response_id"], "resp-base");
+    assert_eq!(requests[1]["input"], json!([next_user]));
+    assert!(requests[2].get("previous_response_id").is_none());
+    assert_eq!(requests[2]["input"].as_array().map(Vec::len), Some(3));
+    assert!(http_captures.0.lock().await.is_empty());
+}
+
+#[tokio::test]
+async fn empty_incremental_terminal_response_retries_once_with_the_full_request() {
+    let http_captures = Captures::default();
+    let http_url = spawn_upstream(http_captures.clone()).await;
+    let websocket_captures = ReuseWebSocketCaptures::default();
+    let websocket_url = spawn_incremental_retry_websocket_upstream(
+        websocket_captures.clone(),
+        json!({
+            "type": "response.completed",
+            "response": {
+                "id": "resp-empty",
+                "status": "completed",
+                "output": []
+            }
+        }),
+    )
+    .await;
+    let app = build_router(
+        ProxyConfig::for_test(http_url, "local-secret").with_websocket_upstream(websocket_url),
+        Arc::new(StubCredentials {
+            refreshes: Arc::new(AtomicUsize::new(0)),
+        }),
+    )
+    .expect("router");
+    let user = json!({"type":"message","role":"user","content":"base"});
+    let assistant = json!({
+        "type": "message",
+        "id": "msg-base",
+        "role": "assistant",
+        "status": "completed",
+        "content": [{
+            "type": "output_text",
+            "text": "base",
+            "annotations": []
+        }]
+    });
+    let next_user = json!({"type":"message","role":"user","content":"next"});
+
+    for (request_id, input) in [
+        ("empty-1", json!([user.clone()])),
+        (
+            "empty-2",
+            json!([user.clone(), assistant, next_user.clone()]),
+        ),
+    ] {
+        let response = tower::ServiceExt::oneshot(
+            app.clone(),
+            axum::http::Request::post("/v1/responses")
+                .header("authorization", "Bearer local-secret")
+                .header("content-type", "application/json")
+                .header("x-request-id", request_id)
+                .header("x-grok-session-id", "grok-session-empty")
+                .body(Body::from(
+                    json!({"model":"gpt-test","input":input}).to_string(),
+                ))
+                .expect("request"),
+        )
+        .await
+        .expect("response");
+        let body = response
+            .into_body()
+            .collect()
+            .await
+            .expect("collect empty-response retry")
+            .to_bytes();
+        if request_id == "empty-2" {
+            let body = String::from_utf8(body.to_vec()).expect("utf8 SSE");
+            assert!(body.contains("retried"));
+            assert!(!body.contains("resp-empty"));
+        }
     }
 
     assert_eq!(websocket_captures.connections.load(Ordering::SeqCst), 1);

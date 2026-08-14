@@ -1372,7 +1372,7 @@ fn bridge_websocket_stream(
         let mut transformer = CodexSseTransformer::default();
         let mut stream_diagnostics =
             WebSocketStreamDiagnostics::new(diagnostics, mode);
-        let mut previous_response_retry_used = false;
+        let mut incremental_retry_used = false;
         let outcome;
         loop {
             let message = match lease.session.connection.as_mut() {
@@ -1409,11 +1409,11 @@ fn bridge_websocket_stream(
                         continue;
                     }
                     if mode.incremental
-                        && !previous_response_retry_used
+                        && !incremental_retry_used
                         && !stream_diagnostics.first_event_logged
                         && websocket_previous_response_not_found(text)
                     {
-                        previous_response_retry_used = true;
+                        incremental_retry_used = true;
                         lease.session.last_response = None;
                         let send_result = match lease.session.connection.as_mut() {
                             Some(websocket) => websocket
@@ -1433,6 +1433,35 @@ fn bridge_websocket_stream(
                                 stream_diagnostics.request.client_request_id.as_str(),
                             model = stream_diagnostics.request.model.as_str(),
                             retry_reason = "previous_response_not_found",
+                            "Codex WebSocket incremental request retried with full input"
+                        );
+                        continue;
+                    }
+                    if mode.incremental
+                        && !incremental_retry_used
+                        && !stream_diagnostics.first_event_logged
+                        && websocket_terminal_response_has_empty_output(text)
+                    {
+                        incremental_retry_used = true;
+                        lease.session.last_response = None;
+                        let send_result = match lease.session.connection.as_mut() {
+                            Some(websocket) => websocket
+                                .send(Message::Text(full_retry_payload.clone().into()))
+                                .await,
+                            None => return,
+                        };
+                        if send_result.is_err() {
+                            stream_diagnostics.finish("transport_error");
+                            yield Err(std::io::Error::other(
+                                "failed to retry full websocket request",
+                            ));
+                            return;
+                        }
+                        tracing::warn!(
+                            client_request_id =
+                                stream_diagnostics.request.client_request_id.as_str(),
+                            model = stream_diagnostics.request.model.as_str(),
+                            retry_reason = "empty_terminal_response",
                             "Codex WebSocket incremental request retried with full input"
                         );
                         continue;
@@ -1506,6 +1535,26 @@ fn websocket_previous_response_not_found(payload: &str) -> bool {
             .and_then(|error| error.get("code"))
             .and_then(Value::as_str)
             == Some("previous_response_not_found")
+}
+
+fn websocket_terminal_response_has_empty_output(payload: &str) -> bool {
+    let Ok(event) = serde_json::from_str::<Value>(payload) else {
+        return false;
+    };
+    if !matches!(
+        event.get("type").and_then(Value::as_str),
+        Some("response.completed" | "response.incomplete")
+    ) {
+        return false;
+    }
+    let Some(response) = event.get("response").and_then(Value::as_object) else {
+        return false;
+    };
+    match response.get("output") {
+        None => true,
+        Some(Value::Array(output)) => output.is_empty(),
+        Some(_) => false,
+    }
 }
 
 fn websocket_event_turn_state(payload: &str) -> Option<String> {
@@ -2153,7 +2202,7 @@ mod tests {
         CachedWebSocketResponse, MAX_CACHED_WEBSOCKET_SESSIONS, RequestDiagnostics,
         WebSocketSession, WebSocketSessionPool, derive_installation_id, extract_sse_error_type,
         normalize_upstream_error_status, prepare_websocket_request, proxy_authorization,
-        proxy_url_from_values, sanitize_error_body,
+        proxy_url_from_values, sanitize_error_body, websocket_terminal_response_has_empty_output,
     };
     use http::{HeaderMap, StatusCode};
     use serde_json::json;
@@ -2230,6 +2279,24 @@ mod tests {
             extract_sse_error_type(br#"data: {"type":"response.completed"}"#),
             None
         );
+    }
+
+    #[test]
+    fn empty_terminal_response_detection_excludes_failures_and_nonempty_output() {
+        for kind in ["response.completed", "response.incomplete"] {
+            assert!(websocket_terminal_response_has_empty_output(
+                &json!({"type": kind, "response": {"output": []}}).to_string()
+            ));
+            assert!(websocket_terminal_response_has_empty_output(
+                &json!({"type": kind, "response": {}}).to_string()
+            ));
+            assert!(!websocket_terminal_response_has_empty_output(
+                &json!({"type": kind, "response": {"output": [{}]}}).to_string()
+            ));
+        }
+        assert!(!websocket_terminal_response_has_empty_output(
+            r#"{"type":"response.failed","response":{"output":[]}}"#
+        ));
     }
 
     #[test]
