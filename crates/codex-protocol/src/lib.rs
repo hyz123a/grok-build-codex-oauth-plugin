@@ -16,6 +16,7 @@ use thiserror::Error;
 pub const DEFAULT_ORIGINATOR: &str = "grok-build";
 pub const GROK_CODEX_SYSTEM_PROMPT_TEMPLATE: &str =
     include_str!(concat!(env!("OUT_DIR"), "/grok-system-prompt.md"));
+const CODEX_RESPONSE_GUIDELINES: &str = include_str!("../assets/codex-response-guidelines.md");
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct UpstreamRequestIds {
@@ -404,9 +405,7 @@ pub fn apply_codex_response_guidelines(request: &mut Value) -> Result<bool, Prot
     let instructions = instructions
         .as_str()
         .ok_or(ProtocolError::InstructionsMustBeString)?;
-    let replacement = tagged_section(GROK_CODEX_SYSTEM_PROMPT_TEMPLATE, "response_guidelines")
-        .expect("generated Grok prompt must contain response_guidelines");
-
+    let replacement = CODEX_RESPONSE_GUIDELINES.trim();
     let replaced = replace_tagged_section(instructions, "response_guidelines", replacement)
         .or_else(|| replace_tagged_section(instructions, "output_efficiency", replacement));
     let Some(replaced) = replaced else {
@@ -414,14 +413,6 @@ pub fn apply_codex_response_guidelines(request: &mut Value) -> Result<bool, Prot
     };
     object.insert("instructions".into(), Value::String(replaced));
     Ok(true)
-}
-
-fn tagged_section<'a>(text: &'a str, tag: &str) -> Option<&'a str> {
-    let start_tag = format!("<{tag}>");
-    let end_tag = format!("</{tag}>");
-    let start = text.find(&start_tag)? + start_tag.len();
-    let end = text[start..].find(&end_tag)? + start;
-    Some(text[start..end].trim())
 }
 
 fn replace_tagged_section(text: &str, tag: &str, replacement: &str) -> Option<String> {

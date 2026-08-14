@@ -95,12 +95,11 @@ logs.
 The proxy preserves Grok's rendered system prompt, including its tools, permissions, safety rules,
 and agent loop, but replaces the `<response_guidelines>` section with the Codex-style policy stored
 in `crates/codex-protocol/assets/codex-response-guidelines.md`. Grok's compact
-`<output_efficiency>` variant is handled the same way. During compilation, `codex-protocol` fetches
-the current template from Grok Build's `main` branch, verifies the expected section, and generates
-the modified template in Cargo's `OUT_DIR`. Set `GROK_BUILD_PROMPT_REV` to a commit SHA for a
-reproducible build. The build fails explicitly when the template cannot be downloaded or no longer
-contains the expected section. The legacy `~/.grok/codex-oauth/additional-instructions.md` file is
-no longer created or read.
+`<output_efficiency>` variant is handled the same way. Prompts without either legacy section are
+left unchanged. During compilation, `codex-protocol` fetches the current template from Grok Build's
+`main` branch and generates the compatible template in Cargo's `OUT_DIR`. Set
+`GROK_BUILD_PROMPT_REV` to a commit SHA for a reproducible build. The legacy
+`~/.grok/codex-oauth/additional-instructions.md` file is no longer created or read.
 
 `setup` marks the managed Codex model entries as backend-search capable and, when no explicit
 non-Codex search model is configured, sets `[models].web_search` to `codex-sol`. Search requests

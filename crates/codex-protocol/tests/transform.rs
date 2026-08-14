@@ -155,9 +155,10 @@ fn codex_response_guidelines_replace_grok_style_without_promoting_user_reminders
 
 #[test]
 fn response_guidelines_are_a_no_op_when_grok_section_is_absent() {
-    let mut request = json!({"instructions": "Existing."});
+    let current_prompt = "<communication>\nKeep the current guidance.\n</communication>";
+    let mut request = json!({"instructions": current_prompt});
     assert!(!apply_codex_response_guidelines(&mut request).expect("no replacement"));
-    assert_eq!(request["instructions"], "Existing.");
+    assert_eq!(request["instructions"], current_prompt);
 }
 
 #[test]

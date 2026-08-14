@@ -23,7 +23,7 @@ fn main() -> Result<(), Box<dyn Error>> {
         .text()?;
     let replacement = fs::read_to_string(RESPONSE_GUIDELINES_PATH)?;
     let generated = replace_tagged_section(&source, "response_guidelines", replacement.trim())
-        .ok_or("upstream Grok prompt is missing a complete <response_guidelines> section")?;
+        .unwrap_or(source);
 
     let output = PathBuf::from(env::var_os("OUT_DIR").ok_or("OUT_DIR is not set")?)
         .join("grok-system-prompt.md");
