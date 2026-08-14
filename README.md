@@ -47,8 +47,9 @@ export NO_PROXY=127.0.0.1,localhost
 
 The HTTP/SSE and WebSocket transports both honor these settings. WebSocket uses `HTTPS_PROXY`
 first, then `ALL_PROXY`, and observes `NO_PROXY`. HTTP proxy URLs may include percent-encoded Basic
-Auth credentials. WebSocket connection setup is limited to 10 seconds and falls back to HTTP/SSE;
-waiting for HTTP/SSE response headers is limited to 30 seconds.
+Auth credentials. WebSocket connection setup and individual sends are each limited to 10 seconds;
+a failed send discards the cached connection and retries once before falling back to HTTP/SSE.
+Waiting for HTTP/SSE response headers is limited to 30 seconds.
 
 Then install the local plugin directory:
 
@@ -78,6 +79,8 @@ grok-codex-oauth login --device-code
 ```text
 login [--device-code]  Authenticate and store credentials
 logout                 Delete credentials and stop the daemon
+stop                   Stop the daemon without deleting credentials
+restart [--port PORT]  Restart the daemon without changing credentials
 status [--json]        Report login/config/daemon state
 setup                  Install or update the built-in selectable model catalog
 models sync            Discover this account's models and update /model
@@ -127,9 +130,9 @@ answers WebSocket Ping frames with Pong, and safely queues or filters private ke
 When the complete next input is a safe extension of the previous turn and all other request
 properties are unchanged, the proxy sends only the input delta with `previous_response_id`;
 otherwise it conservatively sends the full request. Codex turn state is retained for tool
-continuations and reset when a new user turn begins. Closed connections, initial send failures,
-authorization expiry, and missing previous responses are reconnected or retried automatically
-before falling back to HTTP/SSE.
+continuations and reset when a new user turn begins. Closed connections, initial send failures or
+timeouts, authorization expiry, and missing previous responses are reconnected or retried
+automatically before falling back to HTTP/SSE.
 
 The daemon writes timestamped request metadata to `~/.grok/codex-oauth/daemon.log`. Each valid
 proxy request records the selected upstream transport, model and client request ID, upstream status

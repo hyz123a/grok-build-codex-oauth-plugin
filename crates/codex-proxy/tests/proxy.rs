@@ -468,6 +468,47 @@ async fn spawn_closing_websocket_upstream(captures: ReuseWebSocketCaptures) -> S
 }
 
 #[allow(clippy::result_large_err)]
+async fn spawn_stalling_then_recovering_websocket_upstream(
+    connections: Arc<AtomicUsize>,
+) -> String {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind recovering websocket");
+    let address = listener.local_addr().expect("recovering websocket addr");
+    tokio::spawn(async move {
+        loop {
+            let (stream, _) = listener
+                .accept()
+                .await
+                .expect("accept recovering websocket");
+            let connection_index = connections.fetch_add(1, Ordering::SeqCst) + 1;
+            tokio::spawn(async move {
+                let mut websocket = accept_hdr_async(
+                    stream,
+                    |_request: &WebSocketRequest, response: WebSocketResponse| Ok(response),
+                )
+                .await
+                .expect("recovering websocket handshake");
+                if connection_index == 1 {
+                    std::future::pending::<()>().await;
+                }
+                let Some(Ok(Message::Text(_))) = websocket.next().await else {
+                    return;
+                };
+                websocket
+                    .send(Message::Text(
+                        r#"{"type":"response.completed","response":{"id":"resp-recovered","status":"completed","output":[]}}"#
+                            .into(),
+                    ))
+                    .await
+                    .expect("send recovered completion");
+            });
+        }
+    });
+    format!("ws://{address}/responses")
+}
+
+#[allow(clippy::result_large_err)]
 async fn spawn_refreshing_websocket_upstream(attempts: Arc<AtomicUsize>) -> String {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
         .await
@@ -861,6 +902,58 @@ async fn websocket_connect_timeout_falls_back_to_http_sse() {
     assert_eq!(response.status(), StatusCode::OK);
     assert_eq!(response.headers()["x-codex-upstream-transport"], "http-sse");
     assert_eq!(captures.0.lock().await.len(), 1);
+}
+
+#[tokio::test]
+async fn websocket_send_timeout_reconnects_and_retries_once() {
+    let http_captures = Captures::default();
+    let http_url = spawn_upstream(http_captures.clone()).await;
+    let connections = Arc::new(AtomicUsize::new(0));
+    let websocket_url =
+        spawn_stalling_then_recovering_websocket_upstream(connections.clone()).await;
+    let app = build_router(
+        ProxyConfig::for_test(http_url, "local-secret")
+            .with_websocket_upstream(websocket_url)
+            .with_websocket_send_timeout(Duration::from_millis(500)),
+        Arc::new(StubCredentials {
+            refreshes: Arc::new(AtomicUsize::new(0)),
+        }),
+    )
+    .expect("router");
+    let large_input = "x".repeat(10 * 1024 * 1024);
+    let request = json!({
+        "model": "gpt-test",
+        "input": [{"type":"message","role":"user","content":large_input}]
+    });
+
+    let response = tokio::time::timeout(
+        Duration::from_secs(5),
+        tower::ServiceExt::oneshot(
+            app,
+            axum::http::Request::post("/v1/responses")
+                .header("authorization", "Bearer local-secret")
+                .header("content-type", "application/json")
+                .header("x-grok-session-id", "grok-session-send-timeout")
+                .body(Body::from(request.to_string()))
+                .expect("request"),
+        ),
+    )
+    .await
+    .expect("proxy request must not hang")
+    .expect("response");
+
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        response.headers()["x-codex-upstream-transport"],
+        "websocket"
+    );
+    response
+        .into_body()
+        .collect()
+        .await
+        .expect("collect recovered websocket response");
+    assert_eq!(connections.load(Ordering::SeqCst), 2);
+    assert!(http_captures.0.lock().await.is_empty());
 }
 
 #[tokio::test]

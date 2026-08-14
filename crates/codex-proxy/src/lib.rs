@@ -46,6 +46,7 @@ const DEFAULT_BODY_LIMIT: usize = 16 * 1024 * 1024;
 const DEFAULT_MAX_CONCURRENCY: usize = 4;
 const MAX_CACHED_WEBSOCKET_SESSIONS: usize = 64;
 const DEFAULT_WEBSOCKET_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+const DEFAULT_WEBSOCKET_SEND_TIMEOUT: Duration = Duration::from_secs(10);
 const DEFAULT_HTTP_RESPONSE_HEADERS_TIMEOUT: Duration = Duration::from_secs(30);
 const MAX_PROXY_RESPONSE_HEADERS: usize = 16 * 1024;
 static REQUEST_SEQUENCE: AtomicU64 = AtomicU64::new(1);
@@ -169,6 +170,25 @@ impl Drop for CodexWebSocketPump {
     }
 }
 
+#[derive(Debug, Error)]
+enum WebSocketSendError {
+    #[error("timed out after {0:?}")]
+    Timeout(Duration),
+    #[error("transport failed: {0}")]
+    Transport(#[source] WebSocketError),
+}
+
+async fn send_websocket_message(
+    connection: &CodexWebSocketPump,
+    message: Message,
+    timeout: Duration,
+) -> Result<(), WebSocketSendError> {
+    tokio::time::timeout(timeout, connection.send(message))
+        .await
+        .map_err(|_| WebSocketSendError::Timeout(timeout))?
+        .map_err(WebSocketSendError::Transport)
+}
+
 #[async_trait]
 pub trait CredentialProvider: Send + Sync {
     async fn access_credential(&self) -> Result<AccessCredential, String>;
@@ -249,6 +269,7 @@ pub struct ProxyConfig {
     allowed_models: Option<HashSet<String>>,
     websocket_proxy: Option<Url>,
     websocket_connect_timeout: Duration,
+    websocket_send_timeout: Duration,
     http_response_headers_timeout: Duration,
     allow_test_upstream: bool,
 }
@@ -268,6 +289,7 @@ impl ProxyConfig {
             allowed_models: Some(HashSet::new()),
             websocket_proxy: None,
             websocket_connect_timeout: DEFAULT_WEBSOCKET_CONNECT_TIMEOUT,
+            websocket_send_timeout: DEFAULT_WEBSOCKET_SEND_TIMEOUT,
             http_response_headers_timeout: DEFAULT_HTTP_RESPONSE_HEADERS_TIMEOUT,
             allow_test_upstream: false,
         })
@@ -289,6 +311,7 @@ impl ProxyConfig {
             allowed_models: None,
             websocket_proxy: None,
             websocket_connect_timeout: DEFAULT_WEBSOCKET_CONNECT_TIMEOUT,
+            websocket_send_timeout: DEFAULT_WEBSOCKET_SEND_TIMEOUT,
             http_response_headers_timeout: DEFAULT_HTTP_RESPONSE_HEADERS_TIMEOUT,
             allow_test_upstream: true,
         }
@@ -341,6 +364,11 @@ impl ProxyConfig {
         self
     }
 
+    pub fn with_websocket_send_timeout(mut self, timeout: Duration) -> Self {
+        self.websocket_send_timeout = timeout;
+        self
+    }
+
     pub fn with_model_reasoning(
         mut self,
         model: impl Into<String>,
@@ -382,7 +410,9 @@ impl ProxyConfig {
         if self.body_limit == 0 || self.max_concurrency == 0 {
             return Err(ProxyError::InvalidLimit);
         }
-        if self.websocket_connect_timeout.is_zero() || self.http_response_headers_timeout.is_zero()
+        if self.websocket_connect_timeout.is_zero()
+            || self.websocket_send_timeout.is_zero()
+            || self.http_response_headers_timeout.is_zero()
         {
             return Err(ProxyError::InvalidTimeout);
         }
@@ -853,13 +883,22 @@ async fn send_websocket_upstream(
         }
     }
 
-    let send_result = session
-        .connection
-        .as_mut()
-        .ok_or_else(|| "websocket connection is unavailable".to_string())?
-        .send(Message::Text(payload.clone().into()))
-        .await;
-    if send_result.is_err() {
+    let send_result = send_websocket_message(
+        session
+            .connection
+            .as_ref()
+            .ok_or_else(|| "websocket connection is unavailable".to_string())?,
+        Message::Text(payload.clone().into()),
+        state.config.websocket_send_timeout,
+    )
+    .await;
+    if let Err(error) = send_result {
+        tracing::warn!(
+            client_request_id = diagnostics.client_request_id.as_str(),
+            model = diagnostics.model.as_str(),
+            error = %error,
+            "Codex upstream WebSocket send failed; reconnecting"
+        );
         reset_websocket_session(&mut session);
         connection_reused = false;
         prepared = PreparedWebSocketRequest::full(request);
@@ -875,13 +914,21 @@ async fn send_websocket_upstream(
         .await?;
         session.connection = Some(connection);
         session.turn_state = handshake_turn_state;
-        session
-            .connection
-            .as_mut()
-            .ok_or_else(|| "websocket connection is unavailable".to_string())?
-            .send(Message::Text(payload.into()))
-            .await
-            .map_err(|_| "failed to send Codex websocket request after reconnect".to_string())?;
+        let retry_result = send_websocket_message(
+            session
+                .connection
+                .as_ref()
+                .ok_or_else(|| "websocket connection is unavailable".to_string())?,
+            Message::Text(payload.into()),
+            state.config.websocket_send_timeout,
+        )
+        .await;
+        if let Err(error) = retry_result {
+            reset_websocket_session(&mut session);
+            return Err(format!(
+                "failed to send Codex websocket request after reconnect: {error}"
+            ));
+        }
     }
 
     session.last_request = Some(request.clone());

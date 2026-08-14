@@ -68,6 +68,13 @@ enum Commands {
     },
     /// Delete OAuth credentials and stop the local daemon.
     Logout,
+    /// Stop the local daemon without deleting credentials or configuration.
+    Stop,
+    /// Restart the local daemon without changing credentials or configuration.
+    Restart {
+        #[arg(long, default_value_t = DEFAULT_PORT)]
+        port: u16,
+    },
     /// Show login, configuration, and daemon status.
     Status {
         #[arg(long)]
@@ -193,6 +200,8 @@ async fn run(cli: Cli) -> Result<()> {
     match cli.command {
         Commands::Login { device_code } => login(&paths, device_code).await,
         Commands::Logout => logout(&paths).await,
+        Commands::Stop => stop(&paths),
+        Commands::Restart { port } => restart(&paths, port).await,
         Commands::Status { json } => status(&paths, DEFAULT_PORT, json).await,
         Commands::Setup { model, port } => setup(&paths, &model, port),
         Commands::Models {
@@ -501,8 +510,36 @@ fn generate_local_secret() -> String {
 
 async fn logout(paths: &AppPaths) -> Result<()> {
     paths.store().delete().await?;
-    stop_daemon(paths)?;
+    let _ = stop_daemon(paths)?;
     println!("Logged out. The managed Grok model configuration was left in place.");
+    Ok(())
+}
+
+fn stop(paths: &AppPaths) -> Result<()> {
+    match stop_daemon(paths)? {
+        Some(pid) => println!("Stopped Codex OAuth daemon (PID {pid})."),
+        None => println!("Codex OAuth daemon is not running."),
+    }
+    Ok(())
+}
+
+async fn restart(paths: &AppPaths, port: u16) -> Result<()> {
+    let old_pid = stop_daemon(paths)?;
+    if health_status(port).await.is_some() {
+        bail!("port {port} is still served by a process not owned by this installation")
+    }
+    ensure_daemon(paths, port).await?;
+    if health_status(port).await.is_none() {
+        bail!(
+            "daemon did not become healthy after restart; inspect {}",
+            paths.daemon_log.display()
+        )
+    }
+    let new_pid = daemon_pid(paths)?.unwrap_or_else(|| "unknown".to_string());
+    match old_pid {
+        Some(old_pid) => println!("Restarted Codex OAuth daemon (PID {old_pid} -> {new_pid})."),
+        None => println!("Started Codex OAuth daemon (PID {new_pid})."),
+    }
     Ok(())
 }
 
@@ -594,7 +631,7 @@ async fn ensure_daemon(paths: &AppPaths, port: u16) -> Result<()> {
                 != expected_system_prompt_policy_fingerprint,
             "Restarting Codex OAuth daemon because runtime configuration changed"
         );
-        stop_daemon(paths)?;
+        let _ = stop_daemon(paths)?;
         let mut stopped = false;
         for _ in 0..40 {
             if health_status(port).await.is_none() {
@@ -1016,52 +1053,63 @@ fn read_secret(paths: &AppPaths) -> Result<String> {
     Ok(secret.to_owned())
 }
 
-fn stop_daemon(paths: &AppPaths) -> Result<()> {
-    let Ok(pid) = fs::read_to_string(&paths.daemon_pid) else {
-        return Ok(());
+fn daemon_pid(paths: &AppPaths) -> Result<Option<String>> {
+    let pid = match fs::read_to_string(&paths.daemon_pid) {
+        Ok(pid) => pid,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error.into()),
     };
     let pid = pid.trim();
     if pid.is_empty() || !pid.chars().all(|character| character.is_ascii_digit()) {
         bail!("daemon PID file is invalid")
     }
-    if !is_managed_daemon_process(pid)? {
+    Ok(Some(pid.to_string()))
+}
+
+fn stop_daemon(paths: &AppPaths) -> Result<Option<String>> {
+    let Some(pid) = daemon_pid(paths)? else {
+        return Ok(None);
+    };
+    if !is_managed_daemon_process(&pid)? {
         tracing::warn!(pid, "Ignoring stale daemon PID file");
-        remove_pid_file_if_owned(&paths.daemon_pid, pid);
-        return Ok(());
+        remove_pid_file_if_owned(&paths.daemon_pid, &pid);
+        return Ok(None);
     }
     #[cfg(unix)]
     let status = Command::new("kill")
         .arg("-TERM")
-        .arg(pid)
+        .arg(&pid)
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .status()?;
     #[cfg(windows)]
-    let status = Command::new("taskkill").args(["/PID", pid]).status()?;
-    if !status.success() && process_exists(pid) {
+    let status = Command::new("taskkill")
+        .args(["/PID", pid.as_str()])
+        .status()?;
+    if !status.success() && process_exists(&pid) {
         bail!("could not stop daemon process {pid}")
     }
-    if !wait_for_process_exit(pid, DAEMON_STOP_GRACE_PERIOD) {
+    if !wait_for_process_exit(&pid, DAEMON_STOP_GRACE_PERIOD) {
         tracing::warn!(pid, "Daemon did not stop gracefully; terminating it");
         #[cfg(unix)]
         let status = Command::new("kill")
             .arg("-KILL")
-            .arg(pid)
+            .arg(&pid)
             .stdout(Stdio::null())
             .stderr(Stdio::null())
             .status()?;
         #[cfg(windows)]
         let status = Command::new("taskkill")
-            .args(["/F", "/PID", pid])
+            .args(["/F", "/PID", pid.as_str()])
             .status()?;
-        if (!status.success() && process_exists(pid))
-            || !wait_for_process_exit(pid, DAEMON_KILL_WAIT)
+        if (!status.success() && process_exists(&pid))
+            || !wait_for_process_exit(&pid, DAEMON_KILL_WAIT)
         {
             bail!("daemon process {pid} did not exit")
         }
     }
-    remove_pid_file_if_owned(&paths.daemon_pid, pid);
-    Ok(())
+    remove_pid_file_if_owned(&paths.daemon_pid, &pid);
+    Ok(Some(pid))
 }
 
 #[derive(Debug)]
@@ -1222,6 +1270,16 @@ fn check(value: bool) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn stop_and_restart_are_supported_commands() {
+        let stop = Cli::try_parse_from(["grok-codex-oauth", "stop"]).expect("parse stop");
+        assert!(matches!(stop.command, Commands::Stop));
+
+        let restart = Cli::try_parse_from(["grok-codex-oauth", "restart", "--port", "2456"])
+            .expect("parse restart");
+        assert!(matches!(restart.command, Commands::Restart { port: 2456 }));
+    }
 
     #[test]
     fn models_sync_is_a_supported_command() {
