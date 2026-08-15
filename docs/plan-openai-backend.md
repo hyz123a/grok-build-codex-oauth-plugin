@@ -57,8 +57,18 @@ thinking = true                   # DeepSeek thinking/推理模式;false 关闭
 - [x] CLI `models sync` 支持 openai 后端:fetch `{base_url}/models` 写 Grok 模型条目
       (含 per-model `context_window`)。
 
+已完成(第四次迭代 — DeepSeek 推理 + TUI 显示):
+- [x] Grok 只给"推理能力"模型显示 thinking UI:sync 时把配置的 `reasoning_efforts` /
+      `default_reasoning_effort` 写入模型条目(`supports_reasoning_effort = true`)。
+- [x] 流式推理显示:桥接把 DeepSeek 的 `reasoning_content` 实时转成
+      `response.reasoning_text.delta`(含 `sequence_number`/`item_id`/`output_index`/
+      `content_index`)发回;结尾再发终端 `reasoning` 项。Grok TUI 显示 `▲` 思考折叠块。
+- [x] DeepSeek 确实产 reasoning_content(强推理问题 5850 增量),TUI 已验证显示。
+- [x] 排除并发干扰:移除 Grok 会话对 `config.rs` 的多 provider 重构,只保留本项目改动。
+
 遗留(后续按需):
 - [ ] reasoning 内容若为 Grok 加密(`reasoning.encrypted_content`)时无法透传(当前走明文 `content`/`summary`)。
+- [ ] 多 provider(多个命名 OpenAI 兼容后端 + 选择键)暂未实现,由用户另行安排。
 
 ## 1. 背景与目标
 
