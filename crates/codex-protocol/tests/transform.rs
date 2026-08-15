@@ -307,7 +307,66 @@ data: {"type":"response.completed","response":{"id":"resp-1","status":"completed
     );
     assert!(output.contains(r#""type":"web_search_call""#));
     assert!(output.contains(r#""query":"Rust latest release""#));
+}
+
+#[test]
+fn sse_bridge_fills_query_when_backend_action_omits_it() {
+    let mut bridge = CodexSseTransformer::default();
+    let stream = br#"data: {"type":"response.output_item.added","output_index":0,"item":{"type":"web_search_call","id":"ws-1","status":"in_progress"}}
+
+data: {"type":"response.output_item.done","output_index":0,"item":{"type":"web_search_call","id":"ws-1","status":"completed","action":{"type":"search","queries":[{"id":"q-1","query":"Rust latest release"}]}}}
+
+data: {"type":"response.completed","response":{"id":"resp-1","status":"completed","output":[]}}
+
+"#;
+
+    let mut output = bridge.push(stream);
+    output.extend(bridge.finish());
+    let output = String::from_utf8(output.concat()).expect("utf8 SSE");
+
+    let done = output
+        .split("\n\n")
+        .filter_map(|event| event.strip_prefix("data: "))
+        .filter_map(|event| serde_json::from_str::<serde_json::Value>(event).ok())
+        .find(|event| event["type"] == "response.output_item.done")
+        .expect("done event");
+
+    // The action keeps the backend's queries and gains a required query string.
+    assert_eq!(
+        done["item"]["action"]["type"],
+        "search"
+    );
+    assert_eq!(
+        done["item"]["action"]["queries"][0]["query"],
+        "Rust latest release"
+    );
+    assert_eq!(done["item"]["action"]["query"], "");
     assert!(output.contains(r#""status":"completed""#));
+}
+
+#[test]
+fn sse_bridge_fills_query_in_upstream_populated_output_array() {
+    let mut bridge = CodexSseTransformer::default();
+    let stream = br#"data: {"type":"response.completed","response":{"id":"resp-1","status":"completed","output":[{"type":"web_search_call","id":"ws-1","status":"completed","action":{"type":"search","queries":[{"id":"q-1","query":"Rust latest release"}]}},{"type":"message","id":"msg-1","role":"assistant","status":"completed","content":[]}]}}
+
+"#;
+
+    let mut output = bridge.push(stream);
+    output.extend(bridge.finish());
+    let output = String::from_utf8(output.concat()).expect("utf8 SSE");
+
+    let completed = output
+        .split("\n\n")
+        .filter_map(|event| event.strip_prefix("data: "))
+        .filter_map(|event| serde_json::from_str::<serde_json::Value>(event).ok())
+        .find(|event| event["type"] == "response.completed")
+        .expect("completed event");
+
+    let items = completed["response"]["output"].as_array().expect("output");
+    assert_eq!(items[0]["type"], "web_search_call");
+    assert_eq!(items[0]["action"]["queries"][0]["query"], "Rust latest release");
+    assert_eq!(items[0]["action"]["query"], "", "missing query must be filled in-place");
+    assert_eq!(items[1]["type"], "message");
 }
 
 #[test]

@@ -46,6 +46,15 @@ pub struct OpenAIBackendConfig {
     pub reasoning_efforts: Vec<String>,
     /// Default reasoning effort among `reasoning_efforts`.
     pub default_reasoning_effort: Option<String>,
+    /// Speak the provider's Responses API (`{base_url}/responses`) and forward
+    /// the Grok Responses body directly instead of translating it to Chat
+    /// Completions. Enables provider-specific capabilities such as DeepSeek's
+    /// server-side `web_search` tool.
+    pub responses_api: bool,
+    /// Keep Grok's `x_search` tool mapped to the provider's `web_search` tool
+    /// (Responses mode only). Defaults to `responses_api` when unset; set
+    /// `false` to keep dropping search tools.
+    pub web_search: bool,
     pub extra_headers: HashMap<String, String>,
 }
 
@@ -111,6 +120,10 @@ struct RawProviderFields {
     /// Model-name routing prefix for a named provider. Omitted on the default
     /// provider; when omitted on a named provider it defaults to `"{name}/"`.
     model_prefix: Option<String>,
+    /// Responses API mode (see `OpenAIBackendConfig`). `None` = unset.
+    responses_api: Option<bool>,
+    /// Web search enablement in Responses mode. `None` = follow `responses_api`.
+    web_search: Option<bool>,
 }
 
 /// Deserialized shape of the `[backend.openai]` TOML section (or .env file).
@@ -131,6 +144,10 @@ struct RawOpenAIConfig {
     extra_headers: HashMap<String, String>,
     #[serde(default)]
     providers: HashMap<String, RawProviderFields>,
+    /// Responses API mode (see `OpenAIBackendConfig`). `None` = unset.
+    responses_api: Option<bool>,
+    /// Web search enablement in Responses mode. `None` = follow `responses_api`.
+    web_search: Option<bool>,
 }
 
 impl RawOpenAIConfig {
@@ -146,6 +163,8 @@ impl RawOpenAIConfig {
             default_reasoning_effort: self.default_reasoning_effort.clone(),
             extra_headers: self.extra_headers.clone(),
             model_prefix: None,
+            responses_api: self.responses_api,
+            web_search: self.web_search,
         }
     }
 }
@@ -199,6 +218,8 @@ pub fn openai_backend_from_env_file(
     let mut api_key = None;
     let mut model = None;
     let mut extra_headers = HashMap::new();
+    let mut responses_api = None;
+    let mut web_search = None;
     for line in contents.lines() {
         let line = line.trim();
         if line.is_empty() || line.starts_with('#') {
@@ -213,6 +234,8 @@ pub fn openai_backend_from_env_file(
             "OPENAI_BASE_URL" => base_url = Some(value.to_owned()),
             "OPENAI_API_KEY" => api_key = Some(value.to_owned()),
             "OPENAI_MODEL" => model = Some(value.to_owned()),
+            "OPENAI_RESPONSES_API" => responses_api = parse_env_bool(&value),
+            "OPENAI_WEB_SEARCH" => web_search = parse_env_bool(&value),
             _ if key.starts_with("OPENAI_HEADER_") => {
                 let name = key
                     .trim_start_matches("OPENAI_HEADER_")
@@ -236,9 +259,20 @@ pub fn openai_backend_from_env_file(
         default_reasoning_effort: None,
         extra_headers,
         model_prefix: None,
+        responses_api,
+        web_search,
     };
     let default = resolve_provider(fields, None, None, &system_env)?;
     Ok(Some(OpenAIBackends { default, named: Vec::new() }))
+}
+
+/// Parse an `.env` boolean value (`1`, `true`, `yes` are truthy).
+fn parse_env_bool(value: &str) -> Option<bool> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "1" | "true" | "yes" | "on" => Some(true),
+        "0" | "false" | "no" | "off" => Some(false),
+        _ => None,
+    }
 }
 
 /// Resolve the default provider plus every named `[backend.openai.providers.*]`
@@ -321,6 +355,11 @@ fn resolve_provider(
         thinking: raw.thinking,
         reasoning_efforts: raw.reasoning_efforts,
         default_reasoning_effort: raw.default_reasoning_effort,
+        responses_api: raw.responses_api.unwrap_or(false),
+        // Web search defaults to the Responses-mode switch so enabling the
+        // Responses API also enables DeepSeek's server-side web search, unless
+        // explicitly disabled.
+        web_search: raw.web_search.unwrap_or(raw.responses_api.unwrap_or(false)),
         extra_headers: raw.extra_headers,
     }))
 }
@@ -388,6 +427,8 @@ mod tests {
             default_reasoning_effort: None,
             extra_headers: HashMap::new(),
             providers: HashMap::new(),
+            responses_api: None,
+            web_search: None,
         };
         // No base_url anywhere -> empty (not an error), the section may host
         // only named providers.
@@ -404,6 +445,8 @@ mod tests {
             default_reasoning_effort: None,
             extra_headers: HashMap::new(),
             providers: HashMap::new(),
+            responses_api: None,
+            web_search: None,
         };
         assert!(matches!(
             resolve_with_env(missing_key, &no_env),
@@ -466,6 +509,82 @@ mod tests {
         let config = config.default.expect("default provider");
         assert_eq!(config.reasoning_efforts, vec!["low".to_string(), "high".to_string(), "max".to_string()]);
         assert_eq!(config.default_reasoning_effort.as_deref(), Some("high"));
+    }
+
+    #[test]
+    fn toml_parses_responses_api_and_web_search_default_follows() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("proxy.toml");
+        // `responses_api = true` alone must enable web search by default.
+        std::fs::write(
+            &path,
+            "[backend.openai]\n\
+             base_url = \"https://api.deepseek.com\"\n\
+             api_key = \"sk-test\"\n\
+             responses_api = true\n",
+        )
+        .expect("write");
+        let backends = openai_backend_from_toml(&path).expect("parse").expect("present");
+        let config = backends.default.expect("default provider");
+        assert!(config.responses_api);
+        assert!(config.web_search, "web_search should follow responses_api by default");
+    }
+
+    #[test]
+    fn toml_parses_web_search_explicitly_disabled() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("proxy.toml");
+        std::fs::write(
+            &path,
+            "[backend.openai]\n\
+             base_url = \"https://api.deepseek.com\"\n\
+             api_key = \"sk-test\"\n\
+             responses_api = true\n\
+             web_search = false\n",
+        )
+        .expect("write");
+        let backends = openai_backend_from_toml(&path).expect("parse").expect("present");
+        let config = backends.default.expect("default provider");
+        assert!(config.responses_api);
+        assert!(!config.web_search, "explicit web_search = false must be honored");
+    }
+
+    #[test]
+    fn toml_parses_named_provider_responses_api() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("proxy.toml");
+        std::fs::write(
+            &path,
+            "[backend.openai.providers.deepseek]\n\
+             base_url = \"https://api.deepseek.com\"\n\
+             api_key = \"sk-ds\"\n\
+             responses_api = true\n\
+             model_prefix = \"deepseek/\"\n",
+        )
+        .expect("write");
+        let backends = openai_backend_from_toml(&path).expect("parse").expect("present");
+        assert!(backends.default.is_none());
+        assert_eq!(backends.named.len(), 1);
+        assert!(backends.named[0].responses_api);
+        assert!(backends.named[0].web_search);
+    }
+
+    #[test]
+    fn env_file_parses_responses_api_and_web_search() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("backend.env");
+        std::fs::write(
+            &path,
+            "OPENAI_BASE_URL=https://api.deepseek.com\n\
+             OPENAI_API_KEY=sk-test\n\
+             OPENAI_RESPONSES_API=1\n\
+             OPENAI_WEB_SEARCH=true\n",
+        )
+        .expect("write");
+        let backends = openai_backend_from_env_file(&path).expect("parse").expect("present");
+        let config = backends.default.expect("default provider");
+        assert!(config.responses_api);
+        assert!(config.web_search);
     }
 
     #[test]

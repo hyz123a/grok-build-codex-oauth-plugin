@@ -24,7 +24,8 @@
       `lib.rs`。行为未变,现有测试全绿。
 - [x] CLI 接线:daemon 从 `proxy.toml`(或 `backend.env`)读取并注入 `with_openai_backend`;
       配置到 openai 模式时跳过 Codex model 白名单与 OAuth reasoning clamp。
-- [x] openai 模式 web_search:**统一禁用**(`x_search` 直接丢弃,不做白名单)。
+- [x] openai 模式 web_search:Chat 模式统一禁用(`x_search` 直接丢弃);Responses 模式
+      (`responses_api = true`)启用 `x_search`→`web_search` 白名单(见 §7)。
 
 已完成(第五次迭代 — 多 provider,按模型名前缀路由):
 - [x] `OpenAIBackends { default, named }`;`[backend.openai]` 为默认/兜底,
@@ -310,10 +311,44 @@ OPENAI_MODEL=deepseek-chat
 ## 7. Web search
 
 - **Codex**:现有 OAuth 路由不变。
-- **OpenAI**:Chat `/chat/completions` 无标准 `web_search` tool。默认**禁用**并返回明确
-  的 `unsupported` 错误;若目标 provider(如 opencode API)暴露 OpenAI 风格
-  `web_search_options` 或 search tool,作为 provider 特定能力在 `backend/openai.rs`
-  按 base_url 白名单开启。不做通用 web_search 适配。
+- **OpenAI Chat 模式**:Chat `/chat/completions` 无标准 `web_search` tool,默认**禁用**,
+  `x_search` 直接丢弃(不做白名单)。
+- **OpenAI Responses 模式**(`responses_api = true`):目标 provider(如 DeepSeek)在
+  `/responses` 上暴露 OpenAI 风格 `web_search` 服务端工具,作为 provider 特定能力按
+  `responses_api` 开启。实现:请求仍按 Responses 格式直通(`transform_responses_request`
+  把 Grok 的 `x_search` 映射为 `web_search`),SSE 桥复用 `CodexSseTransformer`
+  (`web_search_call` 补 `action`、过滤 keepalive、终端 `output` 汇总)。`web_search`
+  默认取 `responses_api` 的值,可显式 `web_search = false` 关闭。
+- 往返格式归一化(实测 DeepSeek 服务端反序列化要求):
+  - **请求方向**:Grok 会把历史搜索作为 `web_search_call` input 项回传,但其序列化可能
+    缺 `action` 对象(→`missing field 'action'`)或 `search` 类 action 只带 `query` 字符串
+    而缺 `queries` 列表(→`missing field 'queries'`)。代理按 DeepSeek 要求补齐
+    `action`/`type`/`queries`(字符串数组;对象项会抽取 `query`/`text` 文本),`open_page`
+    项保持 `url` 不动。
+  - **响应方向**:DeepSeek 输出的 `web_search_call` action 只含 `queries`/`url` 而没有
+    `query` 字符串,Grok 解码器会报 `missing field 'query'`。`CodexSseTransformer` 在
+    流事件与终端 `output` 数组里为缺 `query` 的 action 补 `query: ""`。
+- 不做通用 web_search 适配(Chat 模式保持禁用,只有显式 Responses 模式才启用)。
+
+### Responses 模式配置示例(DeepSeek)
+
+```toml
+[backend.openai]
+base_url = "https://api.deepseek.com"   # 或 https://api.deepseek.com/v1(自动拼 /responses)
+api_key = "${DEEPSEEK_API_KEY}"
+model = "deepseek-v4-flash"
+responses_api = true    # 走 /responses,默认开启 web_search
+web_search = true       # 可省略(默认跟随 responses_api);显式 false 关闭
+thinking = true
+[backend.openai.model_context_windows]
+"deepseek-v4-flash" = 1048576
+```
+
+`.env` 等价:`OPENAI_RESPONSES_API=1` / `OPENAI_WEB_SEARCH=1`。
+
+注意:DeepSeek Responses API 是无状态协议,`previous_response_id` / `prompt_cache_key` /
+`include` 等 Codex 专属字段会被代理剥掉(上游也会静默忽略),`base_url` 末尾自动拼
+`/responses`。
 
 ## 8. 迁移步骤(分阶段,每阶段可合并、可回滚)
 
@@ -335,7 +370,10 @@ OPENAI_MODEL=deepseek-chat
 - [ ] 用 mock 上游写集成测试:单轮/多轮工具循环、缓存命中字段、错误归一化。
 
 ### 阶段 4 — 收尾
-- [ ] web_search 在 openai 模式的禁用/白名单逻辑 + 文档。
+- [x] web_search 在 openai 模式的禁用/白名单逻辑 + 文档:
+      `responses_api = true` 走 provider 的 `/responses`(DeepSeek 原生 Responses API),
+      复用 codex-protocol 的 `x_search`→`web_search` 映射与 `CodexSseTransformer` 桥;
+      `web_search` 默认跟随 `responses_api`,可显式 `web_search = false` 关闭。
 - [ ] 更新 `architecture.md`、README(双后端对比表、配置示例)。
 - [ ] 端到端联调:`grok-codex-oauth` 新增 `--backend` 入口与 `ensure-daemon` 生效。
 

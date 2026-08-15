@@ -39,6 +39,13 @@ pub(crate) async fn handle_openai(
         return error_response(StatusCode::INTERNAL_SERVER_ERROR, "openai backend not configured");
     };
 
+    // Responses API mode: forward the Grok Responses body to the provider's
+    // `/responses` endpoint (DeepSeek), where server-side `web_search` and other
+    // Responses-native capabilities are available.
+    if config.responses_api {
+        return handle_openai_responses(state, headers, request, client_request_id, config).await;
+    }
+
     let chat_request = match transform_to_chat_completions(request, config) {
         Ok(chat_request) => chat_request,
         Err(message) => return error_response(StatusCode::BAD_REQUEST, &message),
@@ -138,6 +145,276 @@ pub(crate) async fn handle_openai(
     response
 }
 
+/// Handle a request against a provider that speaks the Responses API directly
+/// (e.g. DeepSeek). The Grok Responses body is forwarded almost as-is to
+/// `{base_url}/responses` after the codex-protocol transform, which maps Grok's
+/// `x_search` tool to the provider's `web_search` tool (server-side search) and
+/// normalizes stateless/streaming flags. The SSE bridge is the same
+/// `CodexSseTransformer` the Codex backend uses, so `web_search_call` items get
+/// their required `action` filled and terminal `output` is accumulated.
+async fn handle_openai_responses(
+    state: &crate::AppState,
+    headers: &HeaderMap,
+    request: &Value,
+    client_request_id: &str,
+    config: &OpenAIBackendConfig,
+) -> Response {
+    let started_at = std::time::Instant::now();
+    let transformed = match transform_to_responses_api(request, config) {
+        Ok(transformed) => transformed,
+        Err(message) => return error_response(StatusCode::BAD_REQUEST, &message),
+    };
+    let diagnostics =
+        RequestDiagnostics::new_openai(started_at, headers, &transformed, config.name.as_deref());
+    diagnostics.log_received();
+
+    let base_url = config.base_url.trim_end_matches('/');
+    let url = format!("{base_url}/responses");
+
+    let mut upstream_headers = build_openai_headers(config, headers, client_request_id);
+    upstream_headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
+    upstream_headers.insert("accept", HeaderValue::from_static("text/event-stream"));
+
+    let body = match serde_json::to_vec(&transformed) {
+        Ok(body) => body,
+        Err(_) => {
+            return error_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "failed to encode openai request",
+            );
+        }
+    };
+
+    let send = state
+        .client
+        .post(&url)
+        .headers(upstream_headers)
+        .body(body)
+        .send();
+    let upstream = match tokio::time::timeout(
+        state.config.http_response_headers_timeout,
+        send,
+    )
+    .await
+    {
+        Ok(Ok(response)) => response,
+        Ok(Err(_)) => {
+            diagnostics.log_request_failed(1);
+            return error_response(StatusCode::BAD_GATEWAY, "openai upstream request failed");
+        }
+        Err(_) => {
+            diagnostics.log_request_failed(1);
+            return error_response(
+                StatusCode::BAD_GATEWAY,
+                "openai upstream response headers timed out",
+            );
+        }
+    };
+    diagnostics.log_response_headers(&upstream, 1);
+
+    // The upstream already speaks Responses-format SSE, so reuse the Codex
+    // backend's bridge (`stream_response`), which runs the `CodexSseTransformer`
+    // and fills `web_search_call` actions plus the terminal `output` array.
+    crate::stream_response(upstream, diagnostics).await
+}
+
+/// Translate a Grok Responses request for a provider that speaks the Responses
+/// API directly (e.g. DeepSeek): resolve the model, run the codex-protocol
+/// transform (which maps `x_search` -> `web_search`, moves instructions to the
+/// top level, enforces stateless streaming, and clamps reasoning), then drop
+/// fields DeepSeek does not support.
+pub(super) fn transform_to_responses_api(
+    request: &Value,
+    config: &OpenAIBackendConfig,
+) -> Result<Value, String> {
+    let model = resolve_upstream_model(request, config)?;
+    let options = transform_options(config);
+    let mut transformed =
+        codex_protocol::transform_responses_request(request.clone(), &options)
+            .map_err(|error| error.to_string())?;
+    let Some(object) = transformed.as_object_mut() else {
+        return Err("request body must be a JSON object".to_string());
+    };
+    object.insert("model".into(), Value::String(model));
+    // DeepSeek's Responses API is stateless and silently ignores unsupported
+    // fields; drop the ones that carry Codex-specific meaning so nothing
+    // confusing leaks upstream.
+    object.remove("previous_response_id");
+    object.remove("prompt_cache_key");
+    object.remove("include");
+    dedupe_tools(object);
+    if !config.web_search {
+        drop_search_tools(object);
+    } else {
+        normalize_search_input_items(object);
+    }
+    apply_thinking(config, object);
+    Ok(transformed)
+}
+
+/// Build the `TransformOptions` used by the codex-protocol transform from the
+/// provider's configured reasoning efforts (falling back to codex defaults).
+fn transform_options(config: &OpenAIBackendConfig) -> codex_protocol::TransformOptions {
+    let default = codex_protocol::TransformOptions::default();
+    if config.reasoning_efforts.is_empty() {
+        default
+    } else {
+        codex_protocol::TransformOptions {
+            allowed_reasoning_efforts: config.reasoning_efforts.clone(),
+            default_reasoning_effort: config
+                .default_reasoning_effort
+                .clone()
+                .unwrap_or_else(|| default.default_reasoning_effort.clone()),
+        }
+    }
+}
+
+/// Collapse tools that share an identity so the upstream never sees a duplicate
+/// name (its `Tool names must be unique` rejection). For server-side tools the
+/// identity is the `type` (e.g. `web_search`); for function tools it is the
+/// `name`, keeping the first definition and dropping later duplicates.
+fn dedupe_tools(object: &mut serde_json::Map<String, Value>) {
+    let Some(tools) = object.get_mut("tools").and_then(Value::as_array_mut) else {
+        return;
+    };
+    let mut seen: Vec<String> = Vec::new();
+    tools.retain(|tool| {
+        let Some(tool_object) = tool.as_object() else {
+            return true;
+        };
+        let kind = tool_object.get("type").and_then(Value::as_str).unwrap_or("");
+        let key = if kind == "function" {
+            tool_object
+                .get("name")
+                .and_then(Value::as_str)
+                .map(str::to_owned)
+        } else {
+            Some(kind.to_owned())
+        };
+        let Some(key) = key else {
+            return true;
+        };
+        if seen.contains(&key) {
+            return false;
+        }
+        seen.push(key);
+        true
+    });
+}
+
+/// Grok echoes prior searches back as `web_search_call` input items, but its
+/// serialization may omit fields the DeepSeek Responses deserializer requires:
+/// the `action` object, a `type` inside it, and for `search` actions a
+/// `queries` list of strings (Grok carries only a `query` string). Normalize
+/// each echoed item in place so deserialization succeeds.
+fn normalize_search_input_items(object: &mut serde_json::Map<String, Value>) {
+    let Some(input) = object.get_mut("input").and_then(Value::as_array_mut) else {
+        return;
+    };
+    for item in input.iter_mut() {
+        let Some(item_object) = item.as_object_mut() else {
+            continue;
+        };
+        if item_object.get("type").and_then(Value::as_str) != Some("web_search_call") {
+            continue;
+        }
+        let Some(action) = item_object.get_mut("action").and_then(Value::as_object_mut) else {
+            // No action at all (e.g. Grok's in-progress echo): supply a
+            // harmless placeholder so DeepSeek's deserializer does not reject
+            // the item.
+            item_object.insert(
+                "action".into(),
+                serde_json::json!({"type": "search", "query": "", "queries": []}),
+            );
+            continue;
+        };
+        if action.get("type").and_then(Value::as_str).is_none() {
+            action.insert("type".into(), Value::String("search".into()));
+        }
+        if action.get("type").and_then(Value::as_str) != Some("search") {
+            continue;
+        }
+        let query = action
+            .get("query")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_owned();
+        let queries_ok = match action.get_mut("queries") {
+            Some(Value::Array(entries)) => {
+                // DeepSeek expects plain strings; coerce any echoed objects
+                // (e.g. {"query": "..."}) to their query text.
+                for entry in entries.iter_mut() {
+                    let text = match entry {
+                        Value::String(text) => Some(text.clone()),
+                        Value::Object(map) => map
+                            .get("query")
+                            .or_else(|| map.get("text"))
+                            .and_then(Value::as_str)
+                            .map(str::to_owned),
+                        _ => None,
+                    };
+                    match text {
+                        Some(text) => *entry = Value::String(text),
+                        None => *entry = Value::String(String::new()),
+                    }
+                }
+                !entries.is_empty()
+            }
+            _ => false,
+        };
+        if !queries_ok {
+            action.insert("queries".into(), serde_json::json!([query]));
+        }
+    }
+}
+
+/// Drop Grok's search tool from a Responses body (`x_search` was already mapped
+/// to `web_search` by the transform) and any carried `web_search_call` items.
+fn drop_search_tools(object: &mut serde_json::Map<String, Value>) {
+    if let Some(tools) = object.get_mut("tools").and_then(Value::as_array_mut) {
+        tools.retain(|tool| {
+            tool.get("type").and_then(Value::as_str) != Some("web_search")
+                && tool.get("type").and_then(Value::as_str) != Some("x_search")
+        });
+    }
+    if let Some(input) = object.get_mut("input").and_then(Value::as_array_mut) {
+        input.retain(|item| item.get("type").and_then(Value::as_str) != Some("web_search_call"));
+    }
+}
+
+/// Map the provider's `thinking` flag onto DeepSeek's Responses reasoning
+/// semantics: `effort: "none"` disables thinking mode; `true` (with no explicit
+/// effort) opts into the default effort.
+fn apply_thinking(config: &OpenAIBackendConfig, object: &mut serde_json::Map<String, Value>) {
+    let Some(thinking) = config.thinking else {
+        return;
+    };
+    let reasoning = object
+        .entry("reasoning")
+        .or_insert_with(|| Value::Object(serde_json::Map::new()));
+    let Some(reasoning) = reasoning.as_object_mut() else {
+        return;
+    };
+    match thinking {
+        false => {
+            reasoning.insert("effort".into(), Value::String("none".into()));
+        }
+        true => {
+            if reasoning
+                .get("effort")
+                .and_then(Value::as_str)
+                .is_none_or(|effort| effort.is_empty())
+            {
+                let default_effort = config
+                    .default_reasoning_effort
+                    .clone()
+                    .unwrap_or_else(|| "high".to_string());
+                reasoning.insert("effort".into(), Value::String(default_effort));
+            }
+        }
+    }
+}
+
 fn build_openai_headers(
     config: &OpenAIBackendConfig,
     incoming: &HeaderMap,
@@ -168,23 +445,23 @@ fn build_openai_headers(
 }
 
 /// Translate a Grok Responses request into an OpenAI Chat completions request.
-pub(super) fn transform_to_chat_completions(
+/// Resolve the model to send upstream: prefer the requested model when it is
+/// known (or when no model list is synced), else fall back to the configured
+/// default so Grok's internal models (e.g. `grok-4.5`) map onto the provider.
+/// Named providers then have their routing prefix stripped
+/// (`opencode/deepseek-v4-flash` -> `deepseek-v4-flash`).
+pub(super) fn resolve_upstream_model(
     request: &Value,
     config: &OpenAIBackendConfig,
-) -> Result<Value, String> {
+) -> Result<String, String> {
     let object = request
         .as_object()
         .ok_or_else(|| "request body must be a JSON object".to_string())?;
-
     let requested = object
         .get("model")
         .and_then(Value::as_str)
         .filter(|model| !model.is_empty())
         .map(str::to_owned);
-    // When we have a known model list (synced from `/models`), prefer the
-    // requested model only if it's known; otherwise fall back to the configured
-    // default so Grok's internal models (e.g. `grok-4.5`) map onto the provider
-    // instead of being rejected upstream. Without a known list, use the request.
     let known_models = !config.model_context_windows.is_empty();
     let model = if known_models {
         requested
@@ -199,14 +476,23 @@ pub(super) fn transform_to_chat_completions(
             .or_else(|| config.default_model.clone())
             .ok_or_else(|| "missing `model`; set one in the request or configure `model`".to_string())?
     };
-    // Named providers route by a model-name prefix; strip it before sending the
-    // model upstream so the provider receives its own model id
-    // (e.g. `opencode/deepseek-v4-flash` -> `deepseek-v4-flash`).
-    let upstream_model = config
+    Ok(config
         .model_prefix
         .as_deref()
         .and_then(|prefix| model.strip_prefix(prefix))
-        .unwrap_or(&model);
+        .unwrap_or(&model)
+        .to_owned())
+}
+
+pub(super) fn transform_to_chat_completions(
+    request: &Value,
+    config: &OpenAIBackendConfig,
+) -> Result<Value, String> {
+    let object = request
+        .as_object()
+        .ok_or_else(|| "request body must be a JSON object".to_string())?;
+
+    let upstream_model = resolve_upstream_model(request, config)?;
 
     let mut messages = Vec::new();
 
@@ -305,7 +591,7 @@ pub(super) fn transform_to_chat_completions(
     }
 
     let mut chat = Map::new();
-    chat.insert("model".into(), Value::String(upstream_model.to_owned()));
+    chat.insert("model".into(), Value::String(upstream_model));
     chat.insert("messages".into(), Value::Array(messages));
     if !tools.is_empty() {
         chat.insert("tools".into(), Value::Array(tools));
@@ -895,6 +1181,8 @@ mod tests {
             thinking: None,
             reasoning_efforts: Vec::new(),
             default_reasoning_effort: None,
+            responses_api: false,
+            web_search: false,
             extra_headers: HashMap::new(),
         }
     }
@@ -1060,6 +1348,229 @@ mod tests {
                 {"type": "function", "function": {"name": "get_weather", "description": "w", "parameters": {"type": "object"}}}
             ])
         );
+    }
+
+    #[test]
+    fn responses_mode_maps_x_search_to_web_search_when_enabled() {
+        let mut responses = config();
+        responses.responses_api = true;
+        responses.web_search = true;
+        let request = json!({
+            "model": "deepseek-v4-flash",
+            "input": [{"type": "message", "role": "user", "content": "search the web"}],
+            "tools": [
+                {"type": "x_search"},
+                {"type": "function", "name": "read_file"}
+            ],
+            "previous_response_id": "prev-1",
+            "prompt_cache_key": "cache-1",
+            "include": ["file_search_call.results"]
+        });
+        let transformed = transform_to_responses_api(&request, &responses).expect("transform");
+        assert_eq!(transformed["model"], "deepseek-v4-flash");
+        assert_eq!(transformed["stream"], true);
+        assert_eq!(transformed["store"], false);
+        // x_search is mapped to web_search and kept.
+        let tools = transformed["tools"].as_array().expect("tools");
+        assert_eq!(tools[0], json!({"type": "web_search"}));
+        assert_eq!(tools[1], json!({"type": "function", "name": "read_file"}));
+        // DeepSeek-unsupported fields are dropped.
+        assert!(transformed.get("previous_response_id").is_none());
+        assert!(transformed.get("prompt_cache_key").is_none());
+        assert!(transformed.get("include").is_none());
+    }
+
+    #[test]
+    fn responses_mode_drops_web_search_when_disabled() {
+        let mut responses = config();
+        responses.responses_api = true;
+        responses.web_search = false;
+        let request = json!({
+            "model": "deepseek-v4-flash",
+            "input": [
+                {"type": "message", "role": "user", "content": "hi"},
+                {"type": "web_search_call", "id": "ws-1"}
+            ],
+            "tools": [{"type": "x_search"}]
+        });
+        let transformed = transform_to_responses_api(&request, &responses).expect("transform");
+        let tools = transformed["tools"].as_array().expect("tools");
+        assert!(tools.is_empty(), "web_search tool must be dropped when disabled");
+        let input = transformed["input"].as_array().expect("input");
+        assert!(input.iter().all(|item| item.get("type").and_then(Value::as_str) != Some("web_search_call")));
+    }
+
+    #[test]
+    fn responses_mode_normalizes_search_input_items_to_queries() {
+        let mut responses = config();
+        responses.responses_api = true;
+        responses.web_search = true;
+        let request = json!({
+            "model": "deepseek-v4-flash",
+            "input": [
+                {"type": "message", "role": "user", "content": "keep going"},
+                {"type": "web_search_call", "id": "ws-1", "status": "completed",
+                 "action": {"type": "search", "query": "Rust latest release"}}
+            ]
+        });
+        let transformed = transform_to_responses_api(&request, &responses).expect("transform");
+        let search = transformed["input"]
+            .as_array()
+            .expect("input")
+            .iter()
+            .find(|item| item["type"] == "web_search_call")
+            .expect("web_search_call kept");
+        // The action is preserved (DeepSeek expects it passed back) and gains
+        // a queries list derived from the query string.
+        assert_eq!(search["action"]["type"], "search");
+        assert_eq!(search["action"]["queries"][0], "Rust latest release");
+        assert_eq!(search["action"]["query"], "Rust latest release");
+    }
+
+    #[test]
+    fn responses_mode_normalizes_action_less_search_input_item() {
+        let mut responses = config();
+        responses.responses_api = true;
+        responses.web_search = true;
+        // Grok echoes an in-progress search without an action; DeepSeek's
+        // deserializer requires the action object.
+        let request = json!({
+            "model": "deepseek-v4-flash",
+            "input": [
+                {"type": "message", "role": "user", "content": "keep going"},
+                {"type": "web_search_call", "id": "ws-1", "status": "in_progress"}
+            ]
+        });
+        let transformed = transform_to_responses_api(&request, &responses).expect("transform");
+        let search = transformed["input"]
+            .as_array()
+            .expect("input")
+            .iter()
+            .find(|item| item["type"] == "web_search_call")
+            .expect("web_search_call kept");
+        assert_eq!(search["action"]["type"], "search");
+        assert_eq!(search["action"]["query"], "");
+        assert!(search["action"]["queries"].as_array().is_some());
+    }
+
+    #[test]
+    fn responses_mode_normalizes_object_queries_to_strings() {
+        let mut responses = config();
+        responses.responses_api = true;
+        responses.web_search = true;
+        // A echoed item whose queries are objects (not strings) must be coerced
+        // to plain strings for DeepSeek's deserializer.
+        let request = json!({
+            "model": "deepseek-v4-flash",
+            "input": [
+                {"type": "message", "role": "user", "content": "keep going"},
+                {"type": "web_search_call", "id": "ws-1",
+                 "action": {"type": "search", "queries": [{"query": "first"}, {"text": "second"}]}}
+            ]
+        });
+        let transformed = transform_to_responses_api(&request, &responses).expect("transform");
+        let search = transformed["input"]
+            .as_array()
+            .expect("input")
+            .iter()
+            .find(|item| item["type"] == "web_search_call")
+            .expect("web_search_call kept");
+        let queries = search["action"]["queries"].as_array().expect("queries array");
+        assert_eq!(queries.len(), 2);
+        assert_eq!(queries[0], "first");
+        assert_eq!(queries[1], "second");
+    }
+
+    #[test]
+    fn responses_mode_leaves_open_page_echo_untouched() {
+        let mut responses = config();
+        responses.responses_api = true;
+        responses.web_search = true;
+        // open_page actions carry a url, not queries; DeepSeek accepts them
+        // as-is, so normalization must not add a bogus queries list.
+        let request = json!({
+            "model": "deepseek-v4-flash",
+            "input": [
+                {"type": "message", "role": "user", "content": "keep going"},
+                {"type": "web_search_call", "id": "ws-1",
+                 "action": {"type": "open_page", "url": "https://blog.rust-lang.org"}}
+            ]
+        });
+        let transformed = transform_to_responses_api(&request, &responses).expect("transform");
+        let search = transformed["input"]
+            .as_array()
+            .expect("input")
+            .iter()
+            .find(|item| item["type"] == "web_search_call")
+            .expect("web_search_call kept");
+        assert_eq!(search["action"]["type"], "open_page");
+        assert_eq!(search["action"]["url"], "https://blog.rust-lang.org");
+        assert!(search["action"].get("queries").is_none(), "open_page must not gain queries");
+    }
+
+    #[test]
+    fn responses_mode_thinking_false_sets_effort_none() {
+        let mut responses = config();
+        responses.responses_api = true;
+        responses.thinking = Some(false);
+        let request = json!({
+            "model": "deepseek-v4-flash",
+            "input": [{"type": "message", "role": "user", "content": "hi"}]
+        });
+        let transformed = transform_to_responses_api(&request, &responses).expect("transform");
+        assert_eq!(transformed["reasoning"]["effort"], "none");
+    }
+
+    #[test]
+    fn responses_mode_dedupes_tools_by_name() {
+        let mut responses = config();
+        responses.responses_api = true;
+        responses.web_search = true;
+        let request = json!({
+            "model": "deepseek-v4-flash",
+            "input": [{"type": "message", "role": "user", "content": "hi"}],
+            "tools": [
+                {"type": "function", "name": "read_file", "description": "first"},
+                {"type": "function", "name": "read_file", "description": "duplicate"},
+                {"type": "x_search"},
+                {"type": "web_search"}
+            ]
+        });
+        let transformed = transform_to_responses_api(&request, &responses).expect("transform");
+        let tools = transformed["tools"].as_array().expect("tools");
+        let names: Vec<&str> = tools
+            .iter()
+            .map(|t| t.get("name").and_then(Value::as_str).unwrap_or(t.get("type").and_then(Value::as_str).unwrap_or("")))
+            .collect();
+        assert_eq!(names, vec!["read_file", "web_search"]);
+        assert_eq!(tools[0]["description"], "first");
+    }
+
+    #[test]
+    fn resolve_upstream_model_strips_prefix_and_falls_back_to_default() {
+        let mut named = config();
+        named.model_prefix = Some("opencode/".into());
+        named.default_model = Some("opencode/deepseek-v4-flash".into());
+        named.model_context_windows = HashMap::from([
+            ("opencode/deepseek-v4-flash".to_string(), 1_048_576),
+        ]);
+        let request = json!({"model": "opencode/deepseek-v4-flash"});
+        assert_eq!(
+            resolve_upstream_model(&request, &named).expect("resolve"),
+            "deepseek-v4-flash"
+        );
+        // An internal Grok model routed to this provider maps to its default.
+        let grok_request = json!({"model": "grok-4.5"});
+        assert_eq!(
+            resolve_upstream_model(&grok_request, &named).expect("resolve"),
+            "deepseek-v4-flash"
+        );
+        // Missing model with no default is an error.
+        let mut no_default = config();
+        no_default.model_context_windows = HashMap::from([
+            ("deepseek-v4-flash".to_string(), 1_048_576),
+        ]);
+        assert!(resolve_upstream_model(&json!({}), &no_default).is_err());
     }
 
     #[test]

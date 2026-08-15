@@ -127,6 +127,42 @@ The sync also installs each model's reasoning-effort menu and default. Grok 0.2.
 `low`, `medium`, `high`, `xhigh`, and `max`; a backend-only `ultra` level is omitted until Grok can
 represent it.
 
+## DeepSeek (and other) OpenAI-compatible backends
+
+Besides the default Codex OAuth backend, the proxy can drive any OpenAI-compatible upstream by
+adding a `[backend.openai]` section to `~/.grok/codex-oauth/proxy.toml` (or a `backend.env`). See
+`docs/plan-openai-backend.md` for the full multi-provider configuration.
+
+Most providers (DeepSeek Chat, Groq, Together, opencode zen, ...) speak Chat
+`/chat/completions`; in that mode web search is disabled and Grok's `x_search` tool is dropped.
+
+Since DeepSeek-V4 now exposes a native **Responses API** with server-side `web_search` support, a
+provider can opt into Responses mode with `responses_api = true`. The proxy then forwards the Grok
+Responses body to `{base_url}/responses`, maps Grok's `x_search` to DeepSeek's `web_search` tool,
+and bridges `web_search_call` events back through the same Codex SSE path. Web search defaults to
+enabled in Responses mode (`web_search = true` follows `responses_api`) and can be disabled with
+`web_search = false`.
+
+The round trip is normalized both ways so neither decoder rejects prior searches: when Grok echoes
+a `web_search_call` input item back, the proxy fills the `action` object and, for `search` actions,
+the `queries` string list DeepSeek's deserializer requires; when DeepSeek returns
+`web_search_call` actions that only carry `queries`/`url`, the bridge adds the `query` string
+Grok's stream decoder requires.
+
+```toml
+[backend.openai]
+base_url = "https://api.deepseek.com"     # or https://api.deepseek.com/v1
+api_key = "${DEEPSEEK_API_KEY}"
+model = "deepseek-v4-flash"
+responses_api = true                      # Responses API mode (endpoint /responses)
+web_search = true                         # optional; defaults to responses_api
+[backend.openai.model_context_windows]
+"deepseek-v4-flash" = 1048576
+```
+
+`.env` equivalents: `OPENAI_RESPONSES_API=1`, `OPENAI_WEB_SEARCH=1`. After changing the config,
+restart the daemon to pick it up.
+
 ## Proxy diagnostics
 
 The daemon prefers the Codex Responses WebSocket v2 transport and automatically falls back to

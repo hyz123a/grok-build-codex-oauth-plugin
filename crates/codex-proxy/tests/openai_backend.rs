@@ -84,6 +84,8 @@ fn openai_config(base_url: String) -> OpenAIBackendConfig {
         thinking: None,
         reasoning_efforts: Vec::new(),
         default_reasoning_effort: None,
+        responses_api: false,
+        web_search: false,
         extra_headers: std::collections::HashMap::new(),
     }
 }
@@ -319,4 +321,134 @@ async fn openai_backend_routes_named_provider_by_model_prefix() {
     assert_eq!(deepseek_captured.len(), 1);
     assert_eq!(deepseek_captured[0]["model"], "deepseek-v4-pro");
     assert_eq!(zen_captures.0.lock().expect("captures").len(), 1);
+}
+
+/// Mock DeepSeek Responses API upstream: serves `/responses`, captures the
+/// request, and returns a Responses-format SSE stream with a `web_search_call`
+/// output item and a terminal `response.completed` carrying usage.
+async fn openai_responses_upstream(State(captures): State<Captures>, body: String) -> Response {
+    let value: Value = serde_json::from_str(&body).expect("json");
+    captures.0.lock().expect("captures").push(value);
+    let stream = "data: {\"type\":\"response.output_item.added\",\"output_index\":0,\"item\":{\"type\":\"web_search_call\",\"id\":\"ws-1\",\"status\":\"in_progress\"}}\n\n\
+data: {\"type\":\"response.web_search_call.searching\",\"item_id\":\"ws-1\"}\n\n\
+data: {\"type\":\"response.output_text.delta\",\"item_id\":\"msg-1\",\"output_index\":1,\"content_index\":0,\"delta\":\"Answer\"}\n\n\
+data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp-1\",\"object\":\"response\",\"created_at\":1,\"model\":\"deepseek-v4-flash\",\"status\":\"completed\",\"output\":[],\"usage\":{\"input_tokens\":10,\"input_tokens_details\":{\"cached_tokens\":8},\"output_tokens\":3}}}\n\n";
+    Response::builder()
+        .status(StatusCode::OK)
+        .header("content-type", "text/event-stream")
+        .body(Body::from(stream))
+        .expect("response")
+}
+
+async fn spawn_openai_responses_upstream(captures: Captures) -> String {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind");
+    let address = listener.local_addr().expect("addr");
+    tokio::spawn(async move {
+        axum::serve(
+            listener,
+            Router::new()
+                .route("/responses", post(openai_responses_upstream))
+                .with_state(captures),
+        )
+        .await
+        .expect("server");
+    });
+    format!("http://{address}")
+}
+
+#[tokio::test]
+async fn openai_responses_mode_forwards_web_search_and_bridges_back() {
+    let captures = Captures::default();
+    let base_url = spawn_openai_responses_upstream(captures.clone()).await;
+    let mut config = openai_config(base_url);
+    config.responses_api = true;
+    config.web_search = true;
+    config.default_model = Some("deepseek-v4-flash".into());
+    let app = build_router(
+        ProxyConfig::for_test("http://127.0.0.1/invalid", "local-secret")
+            .with_openai_backend(config),
+        Arc::new(StubCredentials::default()),
+    )
+    .expect("router");
+
+    let response = tower::ServiceExt::oneshot(
+        app,
+        axum::http::Request::post("/v1/responses")
+            .header("authorization", "Bearer local-secret")
+            .header("content-type", "application/json")
+            .body(Body::from(
+                json!({
+                    "model": "deepseek-v4-flash",
+                    "input": [{"type": "message", "role": "user", "content": [{"type": "input_text", "text": "search"}]}],
+                    "tools": [{"type": "x_search"}]
+                })
+                .to_string(),
+            ))
+            .expect("request"),
+    )
+    .await
+    .expect("response");
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = collect_body(response).await;
+    // The web_search_call item must be bridged back with its required `action`
+    // (the CodexSseTransformer fills the placeholder for the in-progress item).
+    assert!(body.contains("\"type\":\"web_search_call\""), "web_search_call must be bridged");
+    assert!(body.contains("\"action\""), "web_search_call must carry an action for Grok's decoder");
+    assert!(body.contains("\"delta\":\"Answer\""));
+    assert!(body.contains("\"type\":\"response.completed\""));
+    assert!(body.contains("\"input_tokens\":10"), "terminal usage should surface");
+
+    let captured = captures.0.lock().expect("captures");
+    assert_eq!(captured.len(), 1);
+    let request = &captured[0];
+    // Must hit the Responses endpoint with a Responses-format body, not a
+    // Chat Completions translation.
+    assert_eq!(request["model"], "deepseek-v4-flash");
+    assert_eq!(request["stream"], true);
+    assert!(request.get("prompt_cache_key").is_none());
+    let tools = request["tools"].as_array().expect("tools");
+    assert_eq!(tools[0], json!({"type": "web_search"}), "x_search should map to web_search");
+}
+
+#[tokio::test]
+async fn openai_responses_mode_drops_web_search_when_disabled() {
+    let captures = Captures::default();
+    let base_url = spawn_openai_responses_upstream(captures.clone()).await;
+    let mut config = openai_config(base_url);
+    config.responses_api = true;
+    config.web_search = false;
+    config.default_model = Some("deepseek-v4-flash".into());
+    let app = build_router(
+        ProxyConfig::for_test("http://127.0.0.1/invalid", "local-secret")
+            .with_openai_backend(config),
+        Arc::new(StubCredentials::default()),
+    )
+    .expect("router");
+
+    let response = tower::ServiceExt::oneshot(
+        app,
+        axum::http::Request::post("/v1/responses")
+            .header("authorization", "Bearer local-secret")
+            .header("content-type", "application/json")
+            .body(Body::from(
+                json!({
+                    "model": "deepseek-v4-flash",
+                    "input": [{"type": "message", "role": "user", "content": "hi"}],
+                    "tools": [{"type": "x_search"}]
+                })
+                .to_string(),
+            ))
+            .expect("request"),
+    )
+    .await
+    .expect("response");
+    assert_eq!(response.status(), StatusCode::OK);
+    drop(collect_body(response).await);
+
+    let captured = captures.0.lock().expect("captures");
+    let tools = captured[0]["tools"].as_array().expect("tools");
+    assert!(tools.is_empty(), "web_search must be dropped when disabled");
 }

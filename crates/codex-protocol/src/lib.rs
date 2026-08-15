@@ -159,47 +159,64 @@ impl CodexSseTransformer {
                 else {
                     return false;
                 };
-                let output_is_empty = response
-                    .get("output")
-                    .is_none_or(|output| output.as_array().is_none_or(Vec::is_empty));
-                if !output_is_empty || self.output_items.is_empty() {
-                    return false;
+                let mut changed = false;
+                if let Some(output) = response.get_mut("output").and_then(Value::as_array_mut)
+                    && !output.is_empty()
+                {
+                    // Upstreams (e.g. DeepSeek) often include a populated `output`
+                    // array; ensure every web-search item inside it carries the
+                    // `query` field Grok's decoder requires.
+                    for item in output {
+                        changed = ensure_web_search_action(item) || changed;
+                    }
+                } else if !self.output_items.is_empty() {
+                    let output = self
+                        .output_items
+                        .values()
+                        .cloned()
+                        .map(mark_item_completed)
+                        .collect();
+                    response.insert("output".into(), Value::Array(output));
+                    changed = true;
                 }
-                let output = self
-                    .output_items
-                    .values()
-                    .cloned()
-                    .map(mark_item_completed)
-                    .collect();
-                response.insert("output".into(), Value::Array(output));
-                true
+                changed
             }
             _ => false,
         }
     }
 }
 
-/// Grok's Responses decoder requires `action` on every web-search item, while
-/// Codex fills it only when the item is complete. Supply a harmless placeholder
-/// on the initial event; the later completed item replaces it with real data.
+/// Grok's Responses decoder requires `action` on every web-search item and a
+/// `query` string within it, while Codex fills `action` only when the item is
+/// complete (and some backends omit the `query` string, emitting only
+/// `queries`). Supply a harmless placeholder when the action is missing, and
+/// fill in `query` whenever the action lacks one; the later completed item
+/// replaces it with real data.
 fn ensure_web_search_action(item: &mut Value) -> bool {
     let Some(object) = item.as_object_mut() else {
         return false;
     };
-    if object.get("type").and_then(Value::as_str) != Some("web_search_call")
-        || object.contains_key("action")
-    {
+    if object.get("type").and_then(Value::as_str) != Some("web_search_call") {
         return false;
     }
-    object.insert(
-        "action".into(),
-        serde_json::json!({
-            "type": "search",
-            "query": "",
-            "queries": []
-        }),
-    );
-    true
+    let mut changed = false;
+    if object.get("action").and_then(Value::as_object).is_none() {
+        object.insert(
+            "action".into(),
+            serde_json::json!({
+                "type": "search",
+                "query": "",
+                "queries": []
+            }),
+        );
+        changed = true;
+    } else if let Some(action) = object.get_mut("action").and_then(Value::as_object_mut)
+        && action.get("query").and_then(Value::as_str).is_none()
+    {
+        action.insert("query".into(), Value::String(String::new()));
+        changed = true;
+    }
+    changed
 }
 
 fn find_sse_delimiter(buffer: &[u8]) -> Option<(usize, usize)> {
