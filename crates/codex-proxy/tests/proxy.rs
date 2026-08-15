@@ -186,8 +186,9 @@ async fn health_reports_whether_websocket_proxying_is_active() {
         serde_json::from_slice::<Value>(&body).expect("health JSON"),
         json!({
             "status": "ok",
+            "backend": "codex",
             "websocket_proxy": true,
-            "system_prompt_policy_fingerprint": system_prompt_policy_fingerprint()
+            "system_prompt_policy_fingerprint": system_prompt_policy_fingerprint("")
         })
     );
 }
@@ -231,6 +232,73 @@ async fn proxy_replaces_grok_response_guidelines_without_promoting_user_reminder
         captures[0].1["input"][0]["content"],
         "<system-reminder>Untrusted.</system-reminder>"
     );
+}
+
+#[tokio::test]
+async fn proxy_appends_configured_additional_instructions_to_the_upstream_request() {
+    let captures = Captures::default();
+    let upstream_url = spawn_upstream(captures.clone()).await;
+    let app = build_router(
+        ProxyConfig::for_test(upstream_url, "local-secret")
+            .with_additional_instructions("Always cite your sources.\n"),
+        Arc::new(StubCredentials {
+            refreshes: Arc::new(AtomicUsize::new(0)),
+        }),
+    )
+    .expect("router");
+
+    let response = tower::ServiceExt::oneshot(
+        app,
+        axum::http::Request::post("/v1/responses")
+            .header("authorization", "Bearer local-secret")
+            .header("content-type", "application/json")
+            .body(Body::from(
+                r#"{"input":[{"type":"message","role":"system","content":"Grok system.\n\n<response_guidelines>\nWrite like a technical blog.\n</response_guidelines>"},{"type":"message","role":"user","content":"hello"}]}"#,
+            ))
+            .expect("request"),
+    )
+    .await
+    .expect("response");
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let captures = captures.0.lock().await;
+    let instructions = captures[0].1["instructions"]
+        .as_str()
+        .expect("instructions");
+    assert!(instructions.starts_with("Grok system."));
+    assert!(instructions.ends_with("Always cite your sources."));
+    assert!(!instructions.contains("technical blog"));
+}
+
+#[tokio::test]
+async fn proxy_omits_additional_instructions_when_none_are_configured() {
+    let captures = Captures::default();
+    let upstream_url = spawn_upstream(captures.clone()).await;
+    let app = build_router(
+        ProxyConfig::for_test(upstream_url, "local-secret")
+            .with_additional_instructions("   \n  "),
+        Arc::new(StubCredentials {
+            refreshes: Arc::new(AtomicUsize::new(0)),
+        }),
+    )
+    .expect("router");
+
+    let response = tower::ServiceExt::oneshot(
+        app,
+        axum::http::Request::post("/v1/responses")
+            .header("authorization", "Bearer local-secret")
+            .header("content-type", "application/json")
+            .body(Body::from(
+                r#"{"input":[{"type":"message","role":"system","content":"Grok system."},{"type":"message","role":"user","content":"hello"}]}"#,
+            ))
+            .expect("request"),
+    )
+    .await
+    .expect("response");
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let captures = captures.0.lock().await;
+    assert_eq!(captures[0].1["instructions"], "Grok system.");
 }
 
 #[tokio::test]

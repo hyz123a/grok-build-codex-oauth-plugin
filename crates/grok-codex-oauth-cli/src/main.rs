@@ -28,7 +28,7 @@ use codex_oauth::{
     build_authorize_url, generate_state, validate_callback,
 };
 use codex_proxy::{
-    CredentialProvider, ProxyConfig, StoredCredentialProvider, build_router,
+    CredentialProvider, OpenAIBackendConfig, ProxyConfig, StoredCredentialProvider, build_router,
     system_prompt_policy_fingerprint, websocket_proxy_configured_from_env,
 };
 use directories::BaseDirs;
@@ -86,6 +86,14 @@ enum Commands {
         model: String,
         #[arg(long, default_value_t = DEFAULT_PORT)]
         port: u16,
+        /// Append this Markdown file's contents to every request's system
+        /// prompt. The file is copied locally; re-running setup without this
+        /// flag keeps the current copy. Use --clear-instructions to remove it.
+        #[arg(long, value_name = "PATH")]
+        custom_instructions: Option<PathBuf>,
+        /// Remove the locally copied custom-instructions file, if any.
+        #[arg(long)]
+        clear_instructions: bool,
     },
     /// Discover and update models available to the signed-in ChatGPT account.
     Models {
@@ -203,7 +211,12 @@ async fn run(cli: Cli) -> Result<()> {
         Commands::Stop => stop(&paths),
         Commands::Restart { port } => restart(&paths, port).await,
         Commands::Status { json } => status(&paths, DEFAULT_PORT, json).await,
-        Commands::Setup { model, port } => setup(&paths, &model, port),
+        Commands::Setup {
+            model,
+            port,
+            custom_instructions,
+            clear_instructions,
+        } => setup(&paths, &model, port, custom_instructions.as_deref(), clear_instructions),
         Commands::Models {
             command: ModelsCommand::Sync,
         } => sync_models(&paths).await,
@@ -234,6 +247,8 @@ struct AppPaths {
     daemon_log: PathBuf,
     grok_config: PathBuf,
     models_cache: PathBuf,
+    additional_instructions: PathBuf,
+    proxy_config: PathBuf,
 }
 
 impl AppPaths {
@@ -248,6 +263,8 @@ impl AppPaths {
             daemon_log: data_dir.join("daemon.log"),
             grok_config: grok_dir.join("config.toml"),
             models_cache: data_dir.join("models-cache.json"),
+            additional_instructions: data_dir.join("additional-instructions.md"),
+            proxy_config: data_dir.join("proxy.toml"),
             data_dir,
         })
     }
@@ -266,6 +283,13 @@ async fn sync_models(paths: &AppPaths) -> Result<()> {
         .ok_or_else(|| anyhow!("not configured; run `grok-codex-oauth setup` first"))?;
     let cached = load_cached_catalog(&paths.models_cache)?;
     let previous_aliases = managed_aliases(cached.as_deref());
+
+    // OpenAI-compatible backend (e.g. DeepSeek): sync the provider's own model
+    // list from its `/models` endpoint instead of the Codex OAuth catalog.
+    if let Some(openai) = load_openai_backend(paths)? {
+        return sync_openai_models(paths, &config, &previous_aliases, &openai).await;
+    }
+
     let provider = StoredCredentialProvider::new(
         Arc::new(paths.store()),
         OAuthClient::new(OAuthConfig::default()),
@@ -300,6 +324,69 @@ async fn sync_models(paths: &AppPaths) -> Result<()> {
             eprintln!("warning: model sync failed ({error}); used fallback catalog");
         }
     }
+    Ok(())
+}
+
+/// Fetch the OpenAI-compatible provider's `/models` list and install each as a
+/// selectable Grok model (`[model.codex-*]`), replacing prior managed entries.
+async fn sync_openai_models(
+    paths: &AppPaths,
+    config: &ModelConfig,
+    previous_aliases: &[String],
+    openai: &OpenAIBackendConfig,
+) -> Result<()> {
+    let url = format!("{}/models", openai.base_url.trim_end_matches('/'));
+    let response = reqwest::Client::new()
+        .get(&url)
+        .header("Authorization", format!("Bearer {}", openai.api_key))
+        .send()
+        .await
+        .with_context(|| format!("could not fetch models from {url}"))?;
+    if !response.status().is_success() {
+        bail!(
+            "models endpoint {url} returned {}: {}",
+            response.status(),
+            String::from_utf8_lossy(&response.bytes().await.unwrap_or_default()).trim()
+        );
+    }
+    let body: serde_json::Value = response.json().await.context("invalid /models JSON response")?;
+    let ids = body
+        .get("data")
+        .and_then(serde_json::Value::as_array)
+        .map(|data| {
+            data.iter()
+                .filter_map(|entry| {
+                    entry.get("id").and_then(serde_json::Value::as_str).map(str::to_owned)
+                })
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+
+    // Advertise each model's configured context window (if any) to Grok so it
+    // doesn't fall back to its 272K default.
+    let models = ids
+        .into_iter()
+        .map(|slug| CatalogModel {
+            display_name: slug.clone(),
+            context_window: openai.model_context_windows.get(&slug).copied(),
+            slug,
+            default_reasoning_effort: None,
+            supported_reasoning_efforts: Vec::new(),
+        })
+        .collect::<Vec<_>>();
+
+    if models.is_empty() {
+        install_fallback_catalog(paths, config, None, previous_aliases)?;
+        eprintln!("warning: the openai provider returned no models; used fallback catalog");
+        return Ok(());
+    }
+    install_discovered_models(&paths.grok_config, config, &models, previous_aliases)?;
+    save_cached_catalog(&paths.models_cache, &models)?;
+    println!(
+        "Synced {} selectable models from {}.",
+        models.len(),
+        openai.base_url.trim_end_matches('/')
+    );
     Ok(())
 }
 
@@ -486,7 +573,13 @@ async fn oauth_callback(
     }
 }
 
-fn setup(paths: &AppPaths, model: &str, port: u16) -> Result<()> {
+fn setup(
+    paths: &AppPaths,
+    model: &str,
+    port: u16,
+    custom_instructions: Option<&Path>,
+    clear_instructions: bool,
+) -> Result<()> {
     fs::create_dir_all(&paths.data_dir)?;
     set_private_dir(&paths.data_dir)?;
     let secret = match fs::read_to_string(&paths.proxy_secret) {
@@ -498,8 +591,65 @@ fn setup(paths: &AppPaths, model: &str, port: u16) -> Result<()> {
         }
     };
     install_model_catalog(&paths.grok_config, &ModelConfig::new(model, port, secret))?;
+    if let Some(source) = custom_instructions {
+        let contents = fs::read_to_string(source).with_context(|| {
+            format!(
+                "could not read custom instructions file {}",
+                source.display()
+            )
+        })?;
+        if contents.trim().is_empty() {
+            bail!("custom instructions file {} is empty", source.display());
+        }
+        write_private_file(&paths.additional_instructions, contents.as_bytes())?;
+        println!(
+            "Installed custom instructions at {}.",
+            paths.additional_instructions.display()
+        );
+    }
+    if clear_instructions {
+        if paths.additional_instructions.exists() {
+            fs::remove_file(&paths.additional_instructions)?;
+            println!(
+                "Removed custom instructions {}.",
+                paths.additional_instructions.display()
+            );
+        } else {
+            println!("No custom instructions were installed; nothing to remove.");
+        }
+    }
     println!("Configured selectable Codex models at http://127.0.0.1:{port}/v1.");
     Ok(())
+}
+
+fn read_additional_instructions(paths: &AppPaths) -> Result<String> {
+    let Ok(contents) = fs::read_to_string(&paths.additional_instructions) else {
+        return Ok(String::new());
+    };
+    if contents.trim().is_empty() {
+        return Ok(String::new());
+    }
+    Ok(contents)
+}
+
+/// Load an optional OpenAI-compatible backend from `proxy.toml` or, failing
+/// that, a `backend.env` file in the data directory. Returns `None` to keep the
+/// default Codex backend.
+fn load_openai_backend(paths: &AppPaths) -> Result<Option<OpenAIBackendConfig>> {
+    if paths.proxy_config.exists() {
+        return codex_proxy::openai_backend_from_toml(&paths.proxy_config)
+            .map_err(|error| anyhow!(error))
+            .with_context(|| {
+                format!("could not load backend config {}", paths.proxy_config.display())
+            });
+    }
+    let env_path = paths.data_dir.join("backend.env");
+    if env_path.exists() {
+        return codex_proxy::openai_backend_from_env_file(&env_path)
+            .map_err(|error| anyhow!(error))
+            .with_context(|| format!("could not load backend config {}", env_path.display()));
+    }
+    Ok(None)
 }
 
 fn generate_local_secret() -> String {
@@ -554,33 +704,46 @@ async fn serve(paths: &AppPaths, port: u16) -> Result<()> {
         Arc::new(paths.store()),
         OAuthClient::new(OAuthConfig::default()),
     ));
-    let mut allowed_models = BUILTIN_CODEX_MODEL_CATALOG
-        .iter()
-        .map(|(_, model, _)| (*model).to_string())
-        .collect::<Vec<_>>();
+    let openai_backend = load_openai_backend(paths)?;
     let mut proxy_config = ProxyConfig::production(secret)?.with_websocket_proxy_from_env()?;
-    match load_cached_catalog(&paths.models_cache) {
-        Ok(Some(models)) => {
-            for model in models {
-                if !allowed_models.contains(&model.slug) {
-                    allowed_models.push(model.slug.clone());
+
+    if let Some(backend) = openai_backend {
+        // OpenAI-compatible backend: no Codex model allowlist or OAuth reasoning
+        // clamps; the provider's own model set applies.
+        proxy_config = proxy_config.with_openai_backend(backend);
+    } else {
+        let mut allowed_models = BUILTIN_CODEX_MODEL_CATALOG
+            .iter()
+            .map(|(_, model, _)| (*model).to_string())
+            .collect::<Vec<_>>();
+        match load_cached_catalog(&paths.models_cache) {
+            Ok(Some(models)) => {
+                for model in models {
+                    if !allowed_models.contains(&model.slug) {
+                        allowed_models.push(model.slug.clone());
+                    }
+                    proxy_config = proxy_config.with_model_reasoning(
+                        model.slug,
+                        model.supported_reasoning_efforts,
+                        model.default_reasoning_effort,
+                    );
                 }
-                proxy_config = proxy_config.with_model_reasoning(
-                    model.slug,
-                    model.supported_reasoning_efforts,
-                    model.default_reasoning_effort,
+            }
+            Ok(None) => {}
+            Err(error) => {
+                tracing::warn!(
+                    error = %error,
+                    "Could not load model reasoning metadata; using compatibility defaults"
                 );
             }
         }
-        Ok(None) => {}
-        Err(error) => {
-            tracing::warn!(
-                error = %error,
-                "Could not load model reasoning metadata; using compatibility defaults"
-            );
-        }
+        proxy_config = proxy_config.with_allowed_models(allowed_models);
     }
-    proxy_config = proxy_config.with_allowed_models(allowed_models);
+
+    let additional_instructions = read_additional_instructions(paths)?;
+    if !additional_instructions.is_empty() {
+        proxy_config = proxy_config.with_additional_instructions(additional_instructions);
+    }
     let app = build_router(proxy_config, credentials)?;
     let address = SocketAddr::from(([127, 0, 0, 1], port));
     let listener = tokio::net::TcpListener::bind(address)
@@ -615,7 +778,9 @@ async fn shutdown_signal() {
 
 async fn ensure_daemon(paths: &AppPaths, port: u16) -> Result<()> {
     let expected_websocket_proxy = websocket_proxy_configured_from_env()?;
-    let expected_system_prompt_policy_fingerprint = system_prompt_policy_fingerprint();
+    let additional_instructions = read_additional_instructions(paths)?;
+    let expected_system_prompt_policy_fingerprint =
+        system_prompt_policy_fingerprint(&additional_instructions);
     if let Some(active) = health_status(port).await {
         if daemon_configuration_matches(
             &active,
@@ -1279,6 +1444,36 @@ mod tests {
         let restart = Cli::try_parse_from(["grok-codex-oauth", "restart", "--port", "2456"])
             .expect("parse restart");
         assert!(matches!(restart.command, Commands::Restart { port: 2456 }));
+    }
+
+    #[test]
+    fn setup_supports_custom_and_cleared_instructions() {
+        let setup = Cli::try_parse_from([
+            "grok-codex-oauth",
+            "setup",
+            "--custom-instructions",
+            "/tmp/rules.md",
+        ])
+        .expect("parse setup with custom instructions");
+        assert!(matches!(
+            setup.command,
+            Commands::Setup {
+                custom_instructions: Some(ref path),
+                clear_instructions: false,
+                ..
+            } if path == Path::new("/tmp/rules.md")
+        ));
+
+        let cleared = Cli::try_parse_from(["grok-codex-oauth", "setup", "--clear-instructions"])
+            .expect("parse setup clearing instructions");
+        assert!(matches!(
+            cleared.command,
+            Commands::Setup {
+                custom_instructions: None,
+                clear_instructions: true,
+                ..
+            }
+        ));
     }
 
     #[test]

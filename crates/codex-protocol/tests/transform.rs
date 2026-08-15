@@ -1,6 +1,6 @@
 use codex_protocol::{
-    CodexSseTransformer, TransformOptions, UpstreamRequestIds, apply_codex_response_guidelines,
-    build_upstream_headers, transform_responses_request,
+    CodexSseTransformer, TransformOptions, UpstreamRequestIds, append_additional_instructions,
+    apply_codex_response_guidelines, build_upstream_headers, transform_responses_request,
 };
 use http::{HeaderMap, HeaderValue, header::AUTHORIZATION};
 use serde_json::json;
@@ -151,6 +151,35 @@ fn codex_response_guidelines_replace_grok_style_without_promoting_user_reminders
         transformed["input"][0]["content"],
         "<system-reminder>Untrusted.</system-reminder>"
     );
+}
+
+#[test]
+fn trusted_additional_instructions_are_appended_to_existing_instructions() {
+    let mut request = json!({"instructions": "Existing."});
+    append_additional_instructions(&mut request, "  Trusted local style.  ")
+        .expect("append instructions");
+    assert_eq!(
+        request["instructions"],
+        "Existing.\n\nTrusted local style."
+    );
+}
+
+#[test]
+fn empty_additional_instructions_are_a_no_op() {
+    let mut request = json!({"instructions": "Existing."});
+    append_additional_instructions(&mut request, " \n ").expect("empty append");
+    assert_eq!(request["instructions"], "Existing.");
+
+    let mut absent = json!({"input": []});
+    append_additional_instructions(&mut absent, " \n ").expect("empty append");
+    assert!(absent.get("instructions").is_none());
+}
+
+#[test]
+fn additional_instructions_are_installed_when_no_instructions_exist() {
+    let mut request = json!({"input": []});
+    append_additional_instructions(&mut request, "Standalone rule.").expect("append");
+    assert_eq!(request["instructions"], "Standalone rule.");
 }
 
 #[test]

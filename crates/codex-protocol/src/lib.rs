@@ -415,6 +415,32 @@ pub fn apply_codex_response_guidelines(request: &mut Value) -> Result<bool, Prot
     Ok(true)
 }
 
+/// Append trusted, locally configured instructions to the rendered system
+/// prompt. This is a no-op when `additional` is empty or whitespace only.
+pub fn append_additional_instructions(
+    request: &mut Value,
+    additional: &str,
+) -> Result<(), ProtocolError> {
+    let additional = additional.trim();
+    if additional.is_empty() {
+        return Ok(());
+    }
+    let object = request
+        .as_object_mut()
+        .ok_or(ProtocolError::RequestMustBeObject)?;
+    match object.get_mut("instructions") {
+        Some(Value::String(existing)) => {
+            existing.push_str("\n\n");
+            existing.push_str(additional);
+        }
+        Some(Value::Null) | None => {
+            object.insert("instructions".into(), Value::String(additional.to_owned()));
+        }
+        Some(_) => return Err(ProtocolError::InstructionsMustBeString),
+    }
+    Ok(())
+}
+
 fn replace_tagged_section(text: &str, tag: &str, replacement: &str) -> Option<String> {
     let start_tag = format!("<{tag}>");
     let end_tag = format!("</{tag}>");

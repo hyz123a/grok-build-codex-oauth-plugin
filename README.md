@@ -82,7 +82,8 @@ logout                 Delete credentials and stop the daemon
 stop                   Stop the daemon without deleting credentials
 restart [--port PORT]  Restart the daemon without changing credentials
 status [--json]        Report login/config/daemon state
-setup                  Install or update the built-in selectable model catalog
+setup [--custom-instructions PATH] [--clear-instructions]
+                       Install or update the built-in selectable model catalog
 models sync            Discover this account's models and update /model
 uninstall-config       Remove only managed [model.codex*] entries
 serve                  Run the foreground loopback proxy
@@ -95,14 +96,20 @@ logs                   Show or follow proxy diagnostic logs
 are never written into Grok configuration, environment variables, command arguments, or normal
 logs.
 
+Pass `setup --custom-instructions rules.md` to append a Markdown file's contents to every request's
+system prompt. The file is copied to `~/.grok/codex-oauth/additional-instructions.md` and read by
+the proxy on startup. Re-running `setup` without the flag keeps the current copy; use
+`setup --clear-instructions` to remove it. When the file is absent (the default), no extra
+instructions are injected.
+
 The proxy preserves Grok's rendered system prompt, including its tools, permissions, safety rules,
 and agent loop, but replaces the `<response_guidelines>` section with the Codex-style policy stored
 in `crates/codex-protocol/assets/codex-response-guidelines.md`. Grok's compact
 `<output_efficiency>` variant is handled the same way. Prompts without either legacy section are
 left unchanged. During compilation, `codex-protocol` fetches the current template from Grok Build's
 `main` branch and generates the compatible template in Cargo's `OUT_DIR`. Set
-`GROK_BUILD_PROMPT_REV` to a commit SHA for a reproducible build. The legacy
-`~/.grok/codex-oauth/additional-instructions.md` file is no longer created or read.
+`GROK_BUILD_PROMPT_REV` to a commit SHA for a reproducible build. Any custom instructions installed
+with `setup --custom-instructions` are appended after the response guidelines.
 
 `setup` marks the managed Codex model entries as backend-search capable and, when no explicit
 non-Codex search model is configured, sets `[models].web_search` to `codex-sol`. Search requests
