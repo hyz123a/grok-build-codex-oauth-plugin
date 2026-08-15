@@ -80,6 +80,8 @@ fn openai_config(base_url: String) -> OpenAIBackendConfig {
         default_model: None,
         model_context_windows: std::collections::HashMap::new(),
         thinking: None,
+        reasoning_efforts: Vec::new(),
+        default_reasoning_effort: None,
         extra_headers: std::collections::HashMap::new(),
     }
 }

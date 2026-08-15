@@ -370,8 +370,8 @@ async fn sync_openai_models(
             display_name: slug.clone(),
             context_window: openai.model_context_windows.get(&slug).copied(),
             slug,
-            default_reasoning_effort: None,
-            supported_reasoning_efforts: Vec::new(),
+            default_reasoning_effort: openai.default_reasoning_effort.clone(),
+            supported_reasoning_efforts: openai.reasoning_efforts.clone(),
         })
         .collect::<Vec<_>>();
 

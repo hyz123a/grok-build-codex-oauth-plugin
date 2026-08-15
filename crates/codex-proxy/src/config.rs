@@ -35,6 +35,11 @@ pub struct OpenAIBackendConfig {
     /// / `false` sends `thinking: enabled|disabled`. Disabling avoids DeepSeek's
     /// requirement to echo `reasoning_content` back on follow-up turns.
     pub thinking: Option<bool>,
+    /// Reasoning effort levels advertised to Grok so it flags synced models as
+    /// reasoning-capable (and shows the thinking UI). Empty means non-reasoning.
+    pub reasoning_efforts: Vec<String>,
+    /// Default reasoning effort among `reasoning_efforts`.
+    pub default_reasoning_effort: Option<String>,
     pub extra_headers: HashMap<String, String>,
 }
 
@@ -67,6 +72,9 @@ struct RawOpenAIConfig {
     #[serde(default)]
     model_context_windows: HashMap<String, i64>,
     thinking: Option<bool>,
+    #[serde(default)]
+    reasoning_efforts: Vec<String>,
+    default_reasoning_effort: Option<String>,
     #[serde(default)]
     extra_headers: HashMap<String, String>,
 }
@@ -146,6 +154,8 @@ pub fn openai_backend_from_env_file(
         model,
         model_context_windows: HashMap::new(),
         thinking: None,
+        reasoning_efforts: Vec::new(),
+        default_reasoning_effort: None,
         extra_headers,
     })
 }
@@ -175,6 +185,8 @@ fn resolve(raw: RawOpenAIConfig) -> Result<Option<OpenAIBackendConfig>, ConfigEr
         default_model: raw.model,
         model_context_windows: raw.model_context_windows,
         thinking: raw.thinking,
+        reasoning_efforts: raw.reasoning_efforts,
+        default_reasoning_effort: raw.default_reasoning_effort,
         extra_headers: raw.extra_headers,
     }))
 }
@@ -229,6 +241,8 @@ mod tests {
             model: None,
             model_context_windows: HashMap::new(),
             thinking: None,
+            reasoning_efforts: Vec::new(),
+            default_reasoning_effort: None,
             extra_headers: HashMap::new(),
         };
         assert!(matches!(resolve(raw), Ok(None)));
@@ -239,6 +253,8 @@ mod tests {
             model: None,
             model_context_windows: HashMap::new(),
             thinking: None,
+            reasoning_efforts: Vec::new(),
+            default_reasoning_effort: None,
             extra_headers: HashMap::new(),
         };
         assert!(matches!(resolve(missing_key), Err(ConfigError::MissingApiKey)));
@@ -277,5 +293,23 @@ mod tests {
         let config = openai_backend_from_toml(&path).expect("parse").expect("present");
         assert_eq!(config.model_context_windows.get("deepseek-v4-flash"), Some(&1_048_576));
         assert_eq!(config.model_context_windows.get("deepseek-v4-pro"), Some(&1_048_576));
+    }
+
+    #[test]
+    fn toml_parses_reasoning_efforts() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("proxy.toml");
+        std::fs::write(
+            &path,
+            "[backend.openai]\n\
+             base_url = \"https://api.deepseek.com/v1\"\n\
+             api_key = \"sk-test\"\n\
+             reasoning_efforts = [\"low\", \"high\", \"max\"]\n\
+             default_reasoning_effort = \"high\"\n",
+        )
+        .expect("write");
+        let config = openai_backend_from_toml(&path).expect("parse").expect("present");
+        assert_eq!(config.reasoning_efforts, vec!["low".to_string(), "high".to_string(), "max".to_string()]);
+        assert_eq!(config.default_reasoning_effort.as_deref(), Some("high"));
     }
 }

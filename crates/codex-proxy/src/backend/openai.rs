@@ -809,6 +809,8 @@ mod tests {
             default_model: None,
             model_context_windows: HashMap::new(),
             thinking: None,
+            reasoning_efforts: Vec::new(),
+            default_reasoning_effort: None,
             extra_headers: HashMap::new(),
         }
     }
