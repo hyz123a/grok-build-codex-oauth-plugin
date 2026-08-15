@@ -11,7 +11,7 @@ use axum::{
 };
 use codex_oauth::AccessCredential;
 use codex_proxy::{
-    CredentialProvider, OpenAIBackendConfig, ProxyConfig, build_router,
+    CredentialProvider, OpenAIBackendConfig, OpenAIBackends, ProxyConfig, build_router,
 };
 use http_body_util::BodyExt;
 use serde_json::{Value, json};
@@ -75,6 +75,8 @@ async fn spawn_openai_upstream(captures: Captures) -> String {
 
 fn openai_config(base_url: String) -> OpenAIBackendConfig {
     OpenAIBackendConfig {
+        name: None,
+        model_prefix: None,
         base_url,
         api_key: "sk-test".into(),
         default_model: None,
@@ -231,4 +233,90 @@ async fn openai_backend_default_model_is_used_when_request_omits_it() {
     assert_eq!(response.status(), StatusCode::OK);
     let captured = captures.0.lock().expect("captures");
     assert_eq!(captured[0]["model"], "deepseek-chat");
+}
+
+#[tokio::test]
+async fn openai_backend_routes_named_provider_by_model_prefix() {
+    // Default provider (DeepSeek) + a named provider (opencode zen) routed by
+    // the `opencode/` model prefix.
+    let deepseek_captures = Captures::default();
+    let deepseek_url = spawn_openai_upstream(deepseek_captures.clone()).await;
+    let zen_captures = Captures::default();
+    let zen_url = spawn_openai_upstream(zen_captures.clone()).await;
+
+    let mut deepseek = openai_config(deepseek_url);
+    deepseek.default_model = Some("deepseek-v4-flash".into());
+    deepseek.model_context_windows = std::collections::HashMap::from([
+        ("deepseek-v4-flash".to_string(), 1_048_576),
+        ("deepseek-v4-pro".to_string(), 1_048_576),
+    ]);
+    let mut zen = openai_config(zen_url);
+    zen.name = Some("opencode-zen".into());
+    zen.model_prefix = Some("opencode/".into());
+    zen.default_model = Some("opencode/deepseek-v4-flash".into());
+    zen.model_context_windows = std::collections::HashMap::from([
+        ("opencode/deepseek-v4-flash".to_string(), 1_048_576),
+    ]);
+
+    let app = build_router(
+        ProxyConfig::for_test("http://127.0.0.1/invalid", "local-secret").with_openai_backends(
+            OpenAIBackends {
+                default: Some(deepseek),
+                named: vec![zen],
+            },
+        ),
+        Arc::new(StubCredentials::default()),
+    )
+    .expect("router");
+
+    // A model with the `opencode/` prefix routes to the named provider, and the
+    // prefix is stripped before it reaches the upstream.
+    let response = tower::ServiceExt::oneshot(
+        app.clone(),
+        axum::http::Request::post("/v1/responses")
+            .header("authorization", "Bearer local-secret")
+            .header("content-type", "application/json")
+            .body(Body::from(
+                json!({
+                    "model": "opencode/deepseek-v4-flash",
+                    "input": [{"type": "message", "role": "user", "content": [{"type": "input_text", "text": "hi"}]}]
+                })
+                .to_string(),
+            ))
+            .expect("request"),
+    )
+    .await
+    .expect("response");
+    assert_eq!(response.status(), StatusCode::OK);
+    drop(collect_body(response).await);
+    {
+        let zen_captured = zen_captures.0.lock().expect("captures");
+        assert_eq!(zen_captured.len(), 1);
+        assert_eq!(zen_captured[0]["model"], "deepseek-v4-flash");
+        assert!(deepseek_captures.0.lock().expect("captures").is_empty());
+    }
+
+    // A plain model (no matching prefix) routes to the default provider.
+    let response = tower::ServiceExt::oneshot(
+        app,
+        axum::http::Request::post("/v1/responses")
+            .header("authorization", "Bearer local-secret")
+            .header("content-type", "application/json")
+            .body(Body::from(
+                json!({
+                    "model": "deepseek-v4-pro",
+                    "input": [{"type": "message", "role": "user", "content": [{"type": "input_text", "text": "hi"}]}]
+                })
+                .to_string(),
+            ))
+            .expect("request"),
+    )
+    .await
+    .expect("response");
+    assert_eq!(response.status(), StatusCode::OK);
+    drop(collect_body(response).await);
+    let deepseek_captured = deepseek_captures.0.lock().expect("captures");
+    assert_eq!(deepseek_captured.len(), 1);
+    assert_eq!(deepseek_captured[0]["model"], "deepseek-v4-pro");
+    assert_eq!(zen_captures.0.lock().expect("captures").len(), 1);
 }

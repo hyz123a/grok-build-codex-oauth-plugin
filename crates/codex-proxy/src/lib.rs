@@ -35,7 +35,7 @@ use tokio::{
 use url::Url;
 
 pub use crate::config::{
-    BackendKind, ConfigError, OpenAIBackendConfig, openai_backend_from_env_file,
+    BackendKind, ConfigError, OpenAIBackendConfig, OpenAIBackends, openai_backend_from_env_file,
     openai_backend_from_toml,
 };
 
@@ -150,16 +150,53 @@ pub struct ProxyConfig {
     allow_test_upstream: bool,
     additional_instructions: Option<String>,
     openai_backend: Option<OpenAIBackendConfig>,
+    openai_named_backends: Vec<OpenAIBackendConfig>,
 }
 
 impl ProxyConfig {
     /// The upstream backend this proxy drives.
     pub fn backend_kind(&self) -> BackendKind {
-        if self.openai_backend.is_some() {
+        if self.openai_backend.is_some() || !self.openai_named_backends.is_empty() {
             BackendKind::Openai
         } else {
             BackendKind::Codex
         }
+    }
+
+    /// Pick the OpenAI-compatible provider that should serve a request with the
+    /// given model name: the named provider whose `model_prefix` matches
+    /// (longest prefix wins), else the default `[backend.openai]` provider, else
+    /// a lone named provider as a fallback. Returns `None` when no OpenAI
+    /// backend is configured or the model matches no provider.
+    pub fn select_openai_backend(
+        &self,
+        model: Option<&str>,
+    ) -> Option<&OpenAIBackendConfig> {
+        if let Some(model) = model {
+            let mut best: Option<&OpenAIBackendConfig> = None;
+            let mut best_len = 0_usize;
+            for backend in &self.openai_named_backends {
+                if let Some(prefix) = &backend.model_prefix
+                    && model.starts_with(prefix.as_str())
+                    && prefix.len() > best_len
+                {
+                    best = Some(backend);
+                    best_len = prefix.len();
+                }
+            }
+            if best.is_some() {
+                return best;
+            }
+        }
+        if self.openai_backend.is_some() {
+            return self.openai_backend.as_ref();
+        }
+        // No default provider: a single named provider acts as the fallback so
+        // the whole proxy can be driven by just one named entry.
+        if self.openai_named_backends.len() == 1 {
+            return self.openai_named_backends.first();
+        }
+        None
     }
     pub fn production(local_secret: impl Into<String>) -> Result<Self, ProxyError> {
         let local_secret = local_secret.into();
@@ -180,6 +217,7 @@ impl ProxyConfig {
             allow_test_upstream: false,
             additional_instructions: None,
             openai_backend: None,
+            openai_named_backends: Vec::new(),
         })
     }
 
@@ -204,12 +242,21 @@ impl ProxyConfig {
             allow_test_upstream: true,
             additional_instructions: None,
             openai_backend: None,
+            openai_named_backends: Vec::new(),
         }
     }
 
     /// Route traffic to an OpenAI Chat-compatible backend instead of Codex.
     pub fn with_openai_backend(mut self, backend: OpenAIBackendConfig) -> Self {
         self.openai_backend = Some(backend);
+        self
+    }
+
+    /// Route traffic to a set of OpenAI Chat-compatible backends (a default
+    /// provider plus any number of named, prefix-routed providers).
+    pub fn with_openai_backends(mut self, backends: OpenAIBackends) -> Self {
+        self.openai_backend = backends.default;
+        self.openai_named_backends = backends.named;
         self
     }
 
@@ -497,6 +544,7 @@ async fn proxy_responses(
     // The Codex model allowlist only applies to the Codex backend; the
     // OpenAI-compatible backend uses the provider's own model set.
     if state.config.openai_backend.is_none()
+        && state.config.openai_named_backends.is_empty()
         && let Some(allowed_models) = &state.config.allowed_models
     {
         let model = parsed.get("model").and_then(Value::as_str);
@@ -509,7 +557,7 @@ async fn proxy_responses(
             );
         }
     }
-    if state.config.openai_backend.is_some() {
+    if state.config.openai_backend.is_some() || !state.config.openai_named_backends.is_empty() {
         let client_request_id = headers
             .get("x-request-id")
             .and_then(|value| value.to_str().ok())
@@ -657,6 +705,9 @@ pub(crate) struct RequestDiagnostics {
     session_id_fingerprint: String,
     thread_id_fingerprint: String,
     prompt_cache_key_fingerprint: Option<String>,
+    /// Named OpenAI-compatible provider serving this request (`None` = the
+    /// default provider or the Codex backend).
+    provider: Option<String>,
 }
 
 impl RequestDiagnostics {
@@ -691,12 +742,18 @@ impl RequestDiagnostics {
                 .and_then(Value::as_str)
                 .filter(|key| !key.is_empty())
                 .map(cache_key_fingerprint),
+            provider: None,
         }
     }
 
     /// Build diagnostics for a backend whose wire request never carries an
     /// explicit `prompt_cache_key` (the OpenAI-compatible backend).
-    pub(crate) fn new_openai(started_at: Instant, headers: &HeaderMap, request: &Value) -> Self {
+    pub(crate) fn new_openai(
+        started_at: Instant,
+        headers: &HeaderMap,
+        request: &Value,
+        provider: Option<&str>,
+    ) -> Self {
         let codex = Self::new(
             started_at,
             headers,
@@ -710,6 +767,7 @@ impl RequestDiagnostics {
         );
         Self {
             prompt_cache_key_fingerprint: None,
+            provider: provider.map(str::to_owned),
             ..codex
         }
     }
@@ -718,6 +776,7 @@ impl RequestDiagnostics {
         tracing::info!(
             client_request_id = self.client_request_id.as_str(),
             model = self.model.as_str(),
+            provider = self.provider.as_deref().unwrap_or("<default>"),
             session_id_fingerprint = self.session_id_fingerprint.as_str(),
             thread_id_fingerprint = self.thread_id_fingerprint.as_str(),
             prompt_cache_key_present = self.prompt_cache_key_fingerprint.is_some(),
@@ -735,6 +794,7 @@ impl RequestDiagnostics {
             client_request_id = self.client_request_id.as_str(),
             upstream_request_id = upstream_request_id.as_str(),
             model = self.model.as_str(),
+            provider = self.provider.as_deref().unwrap_or("<default>"),
             attempt,
             upstream_status = response.status().as_u16(),
             response_headers_ms = elapsed_ms(self.started_at),
@@ -746,6 +806,7 @@ impl RequestDiagnostics {
         tracing::warn!(
             client_request_id = self.client_request_id.as_str(),
             model = self.model.as_str(),
+            provider = self.provider.as_deref().unwrap_or("<default>"),
             attempt,
             total_ms = elapsed_ms(self.started_at),
             outcome = "upstream_request_error",
@@ -772,6 +833,7 @@ impl RequestDiagnostics {
             client_request_id = self.client_request_id.as_str(),
             upstream_request_id,
             model = self.model.as_str(),
+            provider = self.provider.as_deref().unwrap_or("<default>"),
             outcome,
             sse_error_type = sse_error_type.unwrap_or("<none>"),
             total_ms = elapsed_ms(self.started_at),

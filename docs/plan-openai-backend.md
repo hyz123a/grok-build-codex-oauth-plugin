@@ -26,6 +26,15 @@
       配置到 openai 模式时跳过 Codex model 白名单与 OAuth reasoning clamp。
 - [x] openai 模式 web_search:**统一禁用**(`x_search` 直接丢弃,不做白名单)。
 
+已完成(第五次迭代 — 多 provider,按模型名前缀路由):
+- [x] `OpenAIBackends { default, named }`;`[backend.openai]` 为默认/兜底,
+      `[backend.openai.providers.<name>]` 支持任意 N 个命名 provider。
+- [x] 路由:`select_openai_backend(model)` 最长前缀匹配命名 provider → 默认 → 单命名兜底;
+      `transform_to_chat_completions` 剥前缀后发上游(`opencode/deepseek-v4-flash`→`deepseek-v4-flash`)。
+- [x] `models sync` 遍历全部 provider,命名 provider 模型 id 加前缀,alias 不冲突。
+- [x] 日志带 `provider="<name>"`;`/health` 仍上报 `backend=openai`。
+- [x] 测试:配置解析(N 个 provider/前缀缺省/缺 key)、前缀剥离、双上游路由集成。
+
 配置入口(`~/.grok/codex-oauth/proxy.toml`):
 
 ```toml
@@ -41,7 +50,65 @@ thinking = true                   # DeepSeek thinking/推理模式;false 关闭
 "deepseek-v4-pro" = 1048576
 ```
 
-或 `backend.env`:`OPENAI_BASE_URL` / `OPENAI_API_KEY` / `OPENAI_MODEL` / `OPENAI_HEADER_<NAME>`(env 不支持 per-model 上下文/thinking)。
+或 `backend.env`:`OPENAI_BASE_URL` / `OPENAI_API_KEY` / `OPENAI_MODEL` / `OPENAI_HEADER_<NAME>`(env 不支持 per-model 上下文/thinking,也不支持命名 provider)。
+
+### 多 provider(按模型名前缀路由,N 个可扩展)
+
+`[backend.openai]` 是**默认/兜底** provider;额外的命名 provider 放在
+`[backend.openai.providers.<name>]` 下,想加几个加几个:
+
+```toml
+[backend.openai]                       # 默认/兜底 provider(deepseek)
+base_url = "https://api.deepseek.com/v1"
+api_key = "${DEEPSEEK_API_KEY}"
+model = "deepseek-v4-flash"
+thinking = true
+reasoning_efforts = ["low", "high", "max"]
+default_reasoning_effort = "high"
+[backend.openai.model_context_windows]
+"deepseek-v4-flash" = 1048576
+"deepseek-v4-pro" = 1048576
+
+[backend.openai.providers.opencode-zen]   # 命名 provider:opencode zen
+base_url = "https://opencode.ai/zen/v1"   # 注意:不要带 /chat/completions 后缀
+api_key = "${OPENCODE_ZEN_API_KEY}"       # 命名 provider 必须自带 key,不回落 OPENAI_*
+model = "opencode/deepseek-v4-flash"      # 默认模型(带前缀)
+model_prefix = "opencode/"                # 路由前缀;省略时默认 "{name}/"
+thinking = true
+reasoning_efforts = ["low", "high", "max"]
+default_reasoning_effort = "high"
+[backend.openai.providers.opencode-zen.model_context_windows]
+"opencode/deepseek-v4-flash" = 1048576
+"opencode/deepseek-v4-pro" = 1048576
+```
+
+路由规则:
+- 请求 `model` 按**最长前缀**匹配命名 provider 的 `model_prefix` → 命中者;剥掉前缀后发往上游
+  (`opencode/deepseek-v4-flash` → zen 收到 `deepseek-v4-flash`)。
+- 无匹配 → 默认 provider(`[backend.openai]`)。
+- 无默认且只有一个命名 provider → 兜底到它(单 provider 简易模式)。
+- 无默认、多个命名、且无前缀匹配 → 报错。
+
+`models sync` 会遍历全部 provider,命名 provider 的模型 id 统一加前缀
+(`opencode/deepseek-v4-flash`),alias 自动不冲突
+(`codex-deepseek-v4-flash` vs `codex-opencode-deepseek-v4-flash`)。日志带
+`provider="<name>"` 便于区分。
+
+### Token 用量上报(累计总 token,不每次清零)
+
+Grok 的上下文计数(上下文栏 `⇣Nk` / `/context`)用 `response.completed.usage.total_tokens`
+**覆盖**显示值(不累加),所以桥接端必须保证:
+
+- 每个请求只发**一个** `response.completed`(修复前 finish chunk 内联发一次、
+  `finish()` 再发一次,第二次因 `pending_usage` 已被 metrics 抽走而报 0 → 计数器每次清零)。
+- `total_tokens` = 本轮 `input + output`(完整上下文重发,随对话单调增长 → 呈现"累计")。
+- `output_tokens` / `output_tokens_details.reasoning_tokens` 从上游 usage 真实读取
+  (修复前硬编码 0)。
+- 上游请求带 `stream_options: { include_usage: true }`,并兼容 usage 在 finish chunk
+  (DeepSeek)或末尾空 choices chunk(opencode zen)两种位置。
+- 传输错误时先 flush `state.finish()` 再报错,避免模型已完成后断流导致客户端等不到完成事件。
+
+`/usage` 会话记账仍由客户端逐条累加 `input_tokens`/`output_tokens`,此处保持每轮真实值。
 
 已完成(第三次迭代 — DeepSeek 端到端):
 - [x] DeepSeek 缓存命中接入监控:openai 后端捕获 ChatCompletions 流式 usage 尾块
@@ -68,7 +135,7 @@ thinking = true                   # DeepSeek thinking/推理模式;false 关闭
 
 遗留(后续按需):
 - [ ] reasoning 内容若为 Grok 加密(`reasoning.encrypted_content`)时无法透传(当前走明文 `content`/`summary`)。
-- [ ] 多 provider(多个命名 OpenAI 兼容后端 + 选择键)暂未实现,由用户另行安排。
+- [x] 多 provider(多个命名 OpenAI 兼容后端 + 选择键)已实现:见下方「多 provider(按模型名前缀路由)」。
 
 ## 1. 背景与目标
 

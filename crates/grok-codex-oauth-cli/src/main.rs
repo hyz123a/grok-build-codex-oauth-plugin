@@ -28,7 +28,7 @@ use codex_oauth::{
     build_authorize_url, generate_state, validate_callback,
 };
 use codex_proxy::{
-    CredentialProvider, OpenAIBackendConfig, ProxyConfig, StoredCredentialProvider, build_router,
+    CredentialProvider, OpenAIBackends, ProxyConfig, StoredCredentialProvider, build_router,
     system_prompt_policy_fingerprint, websocket_proxy_configured_from_env,
 };
 use directories::BaseDirs;
@@ -284,10 +284,10 @@ async fn sync_models(paths: &AppPaths) -> Result<()> {
     let cached = load_cached_catalog(&paths.models_cache)?;
     let previous_aliases = managed_aliases(cached.as_deref());
 
-    // OpenAI-compatible backend (e.g. DeepSeek): sync the provider's own model
-    // list from its `/models` endpoint instead of the Codex OAuth catalog.
-    if let Some(openai) = load_openai_backend(paths)? {
-        return sync_openai_models(paths, &config, &previous_aliases, &openai).await;
+    // OpenAI-compatible backends: sync each provider's own model list from its
+    // `/models` endpoint instead of the Codex OAuth catalog.
+    if let Some(backends) = load_openai_backends(paths)? {
+        return sync_openai_models(paths, &config, &previous_aliases, &backends).await;
     }
 
     let provider = StoredCredentialProvider::new(
@@ -327,66 +327,82 @@ async fn sync_models(paths: &AppPaths) -> Result<()> {
     Ok(())
 }
 
-/// Fetch the OpenAI-compatible provider's `/models` list and install each as a
-/// selectable Grok model (`[model.codex-*]`), replacing prior managed entries.
+/// Fetch each OpenAI-compatible provider's `/models` list and install them as
+/// selectable Grok models (`[model.codex-*]`), replacing prior managed entries.
+/// Named providers have their model ids prefixed (e.g. `opencode/...`) so their
+/// Grok aliases never collide with the default provider's.
 async fn sync_openai_models(
     paths: &AppPaths,
     config: &ModelConfig,
     previous_aliases: &[String],
-    openai: &OpenAIBackendConfig,
+    backends: &OpenAIBackends,
 ) -> Result<()> {
-    let url = format!("{}/models", openai.base_url.trim_end_matches('/'));
-    let response = reqwest::Client::new()
-        .get(&url)
-        .header("Authorization", format!("Bearer {}", openai.api_key))
-        .send()
-        .await
-        .with_context(|| format!("could not fetch models from {url}"))?;
-    if !response.status().is_success() {
-        bail!(
-            "models endpoint {url} returned {}: {}",
-            response.status(),
-            String::from_utf8_lossy(&response.bytes().await.unwrap_or_default()).trim()
-        );
-    }
-    let body: serde_json::Value = response.json().await.context("invalid /models JSON response")?;
-    let ids = body
-        .get("data")
-        .and_then(serde_json::Value::as_array)
-        .map(|data| {
-            data.iter()
-                .filter_map(|entry| {
-                    entry.get("id").and_then(serde_json::Value::as_str).map(str::to_owned)
-                })
-                .collect::<Vec<_>>()
-        })
-        .unwrap_or_default();
+    let mut models = Vec::new();
+    for provider in backends.all() {
+        let url = format!("{}/models", provider.base_url.trim_end_matches('/'));
+        let response = reqwest::Client::new()
+            .get(&url)
+            .header("Authorization", format!("Bearer {}", provider.api_key))
+            .send()
+            .await
+            .with_context(|| format!("could not fetch models from {url}"))?;
+        if !response.status().is_success() {
+            bail!(
+                "models endpoint {url} returned {}: {}",
+                response.status(),
+                String::from_utf8_lossy(&response.bytes().await.unwrap_or_default()).trim()
+            );
+        }
+        let body: serde_json::Value =
+            response.json().await.context("invalid /models JSON response")?;
+        let ids = body
+            .get("data")
+            .and_then(serde_json::Value::as_array)
+            .map(|data| {
+                data.iter()
+                    .filter_map(|entry| {
+                        entry.get("id").and_then(serde_json::Value::as_str).map(str::to_owned)
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
 
-    // Advertise each model's configured context window (if any) to Grok so it
-    // doesn't fall back to its 272K default.
-    let models = ids
-        .into_iter()
-        .map(|slug| CatalogModel {
-            display_name: slug.clone(),
-            context_window: openai.model_context_windows.get(&slug).copied(),
-            slug,
-            default_reasoning_effort: openai.default_reasoning_effort.clone(),
-            supported_reasoning_efforts: openai.reasoning_efforts.clone(),
-        })
-        .collect::<Vec<_>>();
+        // Prefix the provider's model ids so the displayed Grok model and its
+        // `model` value carry the routing prefix (`opencode/deepseek-v4-flash`).
+        // Advertise each model's configured context window (if any) to Grok so
+        // it doesn't fall back to its 272K default.
+        for id in ids {
+            let slug = provider
+                .model_prefix
+                .as_ref()
+                .map(|prefix| format!("{prefix}{id}"))
+                .unwrap_or_else(|| id.clone());
+            if models.iter().any(|model: &CatalogModel| model.slug == slug) {
+                continue;
+            }
+            models.push(CatalogModel {
+                display_name: slug.clone(),
+                context_window: provider.model_context_windows.get(&slug).copied(),
+                slug,
+                default_reasoning_effort: provider.default_reasoning_effort.clone(),
+                supported_reasoning_efforts: provider.reasoning_efforts.clone(),
+            });
+        }
+    }
 
     if models.is_empty() {
         install_fallback_catalog(paths, config, None, previous_aliases)?;
-        eprintln!("warning: the openai provider returned no models; used fallback catalog");
+        eprintln!("warning: the openai providers returned no models; used fallback catalog");
         return Ok(());
     }
     install_discovered_models(&paths.grok_config, config, &models, previous_aliases)?;
     save_cached_catalog(&paths.models_cache, &models)?;
-    println!(
-        "Synced {} selectable models from {}.",
-        models.len(),
-        openai.base_url.trim_end_matches('/')
-    );
+    let sources = backends
+        .all()
+        .map(|provider| provider.base_url.trim_end_matches('/'))
+        .collect::<Vec<_>>()
+        .join(", ");
+    println!("Synced {} selectable models from {}.", models.len(), sources);
     Ok(())
 }
 
@@ -632,10 +648,10 @@ fn read_additional_instructions(paths: &AppPaths) -> Result<String> {
     Ok(contents)
 }
 
-/// Load an optional OpenAI-compatible backend from `proxy.toml` or, failing
+/// Load the optional OpenAI-compatible backends from `proxy.toml` or, failing
 /// that, a `backend.env` file in the data directory. Returns `None` to keep the
 /// default Codex backend.
-fn load_openai_backend(paths: &AppPaths) -> Result<Option<OpenAIBackendConfig>> {
+fn load_openai_backends(paths: &AppPaths) -> Result<Option<OpenAIBackends>> {
     if paths.proxy_config.exists() {
         return codex_proxy::openai_backend_from_toml(&paths.proxy_config)
             .map_err(|error| anyhow!(error))
@@ -704,13 +720,13 @@ async fn serve(paths: &AppPaths, port: u16) -> Result<()> {
         Arc::new(paths.store()),
         OAuthClient::new(OAuthConfig::default()),
     ));
-    let openai_backend = load_openai_backend(paths)?;
+    let openai_backends = load_openai_backends(paths)?;
     let mut proxy_config = ProxyConfig::production(secret)?.with_websocket_proxy_from_env()?;
 
-    if let Some(backend) = openai_backend {
-        // OpenAI-compatible backend: no Codex model allowlist or OAuth reasoning
-        // clamps; the provider's own model set applies.
-        proxy_config = proxy_config.with_openai_backend(backend);
+    if let Some(backends) = openai_backends.filter(|backends| !backends.is_empty()) {
+        // OpenAI-compatible backends: no Codex model allowlist or OAuth
+        // reasoning clamps; the providers' own model sets apply.
+        proxy_config = proxy_config.with_openai_backends(backends);
     } else {
         let mut allowed_models = BUILTIN_CODEX_MODEL_CATALOG
             .iter()

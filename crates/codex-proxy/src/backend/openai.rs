@@ -32,8 +32,10 @@ pub(crate) async fn handle_openai(
     client_request_id: &str,
 ) -> Response {
     let started_at = std::time::Instant::now();
-    let config = state.config.openai_backend.as_ref();
-    let Some(config) = config else {
+    // Select the provider by model-name prefix; the default provider serves any
+    // model that no named provider's prefix matches.
+    let requested_model = request.get("model").and_then(Value::as_str);
+    let Some(config) = state.config.select_openai_backend(requested_model) else {
         return error_response(StatusCode::INTERNAL_SERVER_ERROR, "openai backend not configured");
     };
 
@@ -41,7 +43,8 @@ pub(crate) async fn handle_openai(
         Ok(chat_request) => chat_request,
         Err(message) => return error_response(StatusCode::BAD_REQUEST, &message),
     };
-    let diagnostics = RequestDiagnostics::new_openai(started_at, headers, &chat_request);
+    let diagnostics =
+        RequestDiagnostics::new_openai(started_at, headers, &chat_request, config.name.as_deref());
     diagnostics.log_received();
 
     let model = chat_request
@@ -102,6 +105,7 @@ pub(crate) async fn handle_openai(
         let response_status = normalize_upstream_error_status(status, &body);
         tracing::warn!(
             model,
+            provider = config.name.as_deref().unwrap_or("<default>"),
             upstream_status = %status,
             upstream_error = %sanitize_error_body(&body),
             "OpenAI-compatible upstream rejected the request"
@@ -195,6 +199,14 @@ pub(super) fn transform_to_chat_completions(
             .or_else(|| config.default_model.clone())
             .ok_or_else(|| "missing `model`; set one in the request or configure `model`".to_string())?
     };
+    // Named providers route by a model-name prefix; strip it before sending the
+    // model upstream so the provider receives its own model id
+    // (e.g. `opencode/deepseek-v4-flash` -> `deepseek-v4-flash`).
+    let upstream_model = config
+        .model_prefix
+        .as_deref()
+        .and_then(|prefix| model.strip_prefix(prefix))
+        .unwrap_or(&model);
 
     let mut messages = Vec::new();
 
@@ -293,12 +305,18 @@ pub(super) fn transform_to_chat_completions(
     }
 
     let mut chat = Map::new();
-    chat.insert("model".into(), Value::String(model));
+    chat.insert("model".into(), Value::String(upstream_model.to_owned()));
     chat.insert("messages".into(), Value::Array(messages));
     if !tools.is_empty() {
         chat.insert("tools".into(), Value::Array(tools));
     }
     chat.insert("stream".into(), Value::Bool(true));
+    // Ask the provider to include the usage block in the stream so the bridge
+    // can report real token counts to Grok (some providers omit it otherwise).
+    chat.insert(
+        "stream_options".into(),
+        json!({ "include_usage": true }),
+    );
     match config.thinking {
         Some(true) => {
             chat.insert("thinking".into(), json!({ "type": "enabled" }));
@@ -422,6 +440,18 @@ fn bridge_openai_sse(
                 Ok(chunk) => chunk,
                 Err(error) => {
                     diagnostics_log_transport(&diagnostics, &upstream_request_id, &model);
+                    // Flush any pending terminal event so a transport error that
+                    // arrives after the model finished cannot strand the client
+                    // waiting for `response.completed`.
+                    for remainder in state.finish() {
+                        let bridged = transformer.push(&remainder);
+                        for bridged_event in bridged {
+                            yield Ok(Bytes::from(bridged_event));
+                        }
+                    }
+                    for remainder in transformer.finish() {
+                        yield Ok(Bytes::from(remainder));
+                    }
                     diagnostics.log_completed("transport_error", &upstream_request_id, None, CompletionMetrics {
                         bytes_received, chunks_received, filtered_keepalive_events, input_tokens, cached_input_tokens,
                     });
@@ -520,11 +550,23 @@ struct ChatStreamState {
     buffer: Vec<u8>,
     output_index: u64,
     tool_calls: HashMap<u64, AccumulatedToolCall>,
+    /// Last usage seen, drained by `take_usage` for metrics (input, cached).
     pending_usage: Option<(u64, u64)>,
+    /// Last usage seen, kept for the terminal `response.completed` event.
+    final_usage: Option<StreamUsage>,
     sequence_number: u64,
     model: String,
     reasoning_content: String,
     reasoning_output_index: Option<u64>,
+}
+
+/// Token usage reported by an OpenAI Chat-compatible stream's trailing chunk.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct StreamUsage {
+    input_tokens: u64,
+    cached_tokens: u64,
+    output_tokens: u64,
+    reasoning_tokens: u64,
 }
 
 impl ChatStreamState {
@@ -595,7 +637,9 @@ impl ChatStreamState {
     }
 
     fn terminal_event(&mut self) -> Vec<u8> {
-        let (input_tokens, cached_tokens) = self.pending_usage.unwrap_or((0, 0));
+        let usage = self.final_usage.unwrap_or_default();
+        let input_tokens = usage.input_tokens;
+        let output_tokens = usage.output_tokens;
         self.emit(json!({
             "type": "response.completed",
             "response": {
@@ -607,10 +651,10 @@ impl ChatStreamState {
                 "output": [],
                 "usage": {
                     "input_tokens": input_tokens,
-                    "output_tokens": 0,
-                    "total_tokens": input_tokens,
-                    "input_tokens_details": { "cached_tokens": cached_tokens },
-                    "output_tokens_details": { "reasoning_tokens": 0 }
+                    "output_tokens": output_tokens,
+                    "total_tokens": input_tokens.saturating_add(output_tokens),
+                    "input_tokens_details": { "cached_tokens": usage.cached_tokens },
+                    "output_tokens_details": { "reasoning_tokens": usage.reasoning_tokens }
                 },
                 "error": null,
                 "incomplete_details": null,
@@ -634,11 +678,12 @@ impl ChatStreamState {
 
     fn observe_chunk(&mut self, chunk: &Value) -> Vec<Vec<u8>> {
         let mut events = Vec::new();
-        // OpenAI Chat-compatible streams report usage in a trailing chunk with an
-        // empty `choices` array; surface it here so the bridge can record cache
-        // accounting even when no output events are emitted for the chunk.
-        if let Some((input, cached)) = extract_usage(chunk) {
-            self.pending_usage = Some((input, cached));
+        // OpenAI Chat-compatible streams report usage in a trailing chunk (some
+        // providers put it in a final empty-`choices` chunk); record it so the
+        // bridge can surface cache accounting and the terminal event's usage.
+        if let Some(usage) = extract_usage(chunk) {
+            self.pending_usage = Some((usage.input_tokens, usage.cached_tokens));
+            self.final_usage = Some(usage);
         }
         let Some(choices) = chunk.get("choices").and_then(Value::as_array) else {
             return events;
@@ -699,7 +744,9 @@ impl ChatStreamState {
             .any(|choice| choice.get("finish_reason").is_some_and(|reason| !reason.is_null()));
         if finished {
             events.extend(self.flush_tool_calls());
-            events.push(self.terminal_event());
+            // The single terminal `response.completed` is emitted once the whole
+            // stream is consumed (see `finish`) so it sees trailing usage chunks
+            // (e.g. opencode zen sends usage AFTER the finish chunk).
             self.output_index = self.output_index.saturating_add(1);
         }
         events
@@ -780,15 +827,15 @@ fn unix_timestamp_ms() -> u128 {
         .as_millis()
 }
 
-/// Read OpenAI Chat-compatible input/cached token counts from a stream chunk's
-/// `usage` block (e.g. `prompt_tokens` + `prompt_tokens_details.cached_tokens`
-/// as reported by DeepSeek).
-fn extract_usage(chunk: &Value) -> Option<(u64, u64)> {
+/// Read OpenAI Chat-compatible token counts from a stream chunk's `usage` block
+/// (e.g. `prompt_tokens`/`completion_tokens` + `prompt_tokens_details.cached_tokens`
+/// as reported by DeepSeek and opencode zen).
+fn extract_usage(chunk: &Value) -> Option<StreamUsage> {
     let usage = chunk.get("usage").and_then(Value::as_object)?;
     let input_tokens = ["prompt_tokens", "input_tokens"]
         .iter()
         .find_map(|key| usage.get(*key).and_then(Value::as_u64))?;
-    let cached_input_tokens = ["prompt_tokens_details", "input_tokens_details"]
+    let cached_tokens = ["prompt_tokens_details", "input_tokens_details"]
         .iter()
         .find_map(|key| {
             usage
@@ -798,7 +845,26 @@ fn extract_usage(chunk: &Value) -> Option<(u64, u64)> {
                 .and_then(Value::as_u64)
         })
         .unwrap_or(0);
-    Some((input_tokens, cached_input_tokens))
+    let output_tokens = ["completion_tokens", "output_tokens"]
+        .iter()
+        .find_map(|key| usage.get(*key).and_then(Value::as_u64))
+        .unwrap_or(0);
+    let reasoning_tokens = ["completion_tokens_details", "output_tokens_details"]
+        .iter()
+        .find_map(|key| {
+            usage
+                .get(*key)
+                .and_then(Value::as_object)
+                .and_then(|details| details.get("reasoning_tokens"))
+                .and_then(Value::as_u64)
+        })
+        .unwrap_or(0);
+    Some(StreamUsage {
+        input_tokens,
+        cached_tokens,
+        output_tokens,
+        reasoning_tokens,
+    })
 }
 
 fn find_sse_delimiter(buffer: &[u8]) -> Option<(usize, usize)> {
@@ -820,6 +886,8 @@ mod tests {
 
     fn config() -> OpenAIBackendConfig {
         OpenAIBackendConfig {
+            name: None,
+            model_prefix: None,
             base_url: "https://api.deepseek.com/v1".into(),
             api_key: "sk-test".into(),
             default_model: None,
@@ -876,6 +944,39 @@ mod tests {
         // Each tool_call_id has a following tool response.
         let tool_ids = msgs.iter().filter_map(|m| m.get("role").and_then(Value::as_str).filter(|r| *r == "tool").map(|_| m.get("tool_call_id").and_then(Value::as_str))).collect::<Vec<_>>();
         assert_eq!(tool_ids, vec![Some("c1"), Some("c2")]);
+    }
+
+    #[test]
+    fn transform_strips_named_provider_model_prefix_upstream() {
+        let mut named = config();
+        named.model_prefix = Some("opencode/".into());
+        named.default_model = Some("opencode/deepseek-v4-flash".into());
+        named.model_context_windows = HashMap::from([
+            ("opencode/deepseek-v4-flash".to_string(), 1_048_576),
+        ]);
+        let request = json!({
+            "model": "opencode/deepseek-v4-flash",
+            "input": [{"type": "message", "role": "user", "content": [{"type": "input_text", "text": "hi"}]}]
+        });
+        let chat = transform_to_chat_completions(&request, &named).expect("transform");
+        assert_eq!(chat["model"], "deepseek-v4-flash");
+    }
+
+    #[test]
+    fn transform_named_provider_falls_back_to_default_when_model_unknown() {
+        let mut named = config();
+        named.model_prefix = Some("opencode/".into());
+        named.default_model = Some("opencode/deepseek-v4-flash".into());
+        named.model_context_windows = HashMap::from([
+            ("opencode/deepseek-v4-flash".to_string(), 1_048_576),
+        ]);
+        // An internal Grok model routed to this provider maps to its default.
+        let request = json!({
+            "model": "grok-4.5",
+            "input": [{"type": "message", "role": "user", "content": [{"type": "input_text", "text": "hi"}]}]
+        });
+        let chat = transform_to_chat_completions(&request, &named).expect("transform");
+        assert_eq!(chat["model"], "deepseek-v4-flash");
     }
 
     #[test]
@@ -972,10 +1073,58 @@ mod tests {
                 "prompt_tokens_details": { "cached_tokens": 42 }
             }
         });
-        assert_eq!(extract_usage(&chunk), Some((90, 42)));
+        let usage = extract_usage(&chunk).expect("usage");
+        assert_eq!(usage.input_tokens, 90);
+        assert_eq!(usage.cached_tokens, 42);
+        assert_eq!(usage.output_tokens, 25);
 
         let without_usage = json!({ "choices": [{"delta": {"content": "hi"}}] });
         assert_eq!(extract_usage(&without_usage), None);
+    }
+
+    #[test]
+    fn terminal_event_reports_real_usage_and_output_tokens() {
+        let mut state = ChatStreamState::new("deepseek-v4-flash".into());
+        // Usage arrives with the finish chunk (DeepSeek) and must survive into
+        // the terminal event even after metrics drained it via take_usage.
+        state.push(
+            br#"data: {"choices":[{"index":0,"delta":{"content":"hi"},"finish_reason":"stop"}],"usage":{"prompt_tokens":90,"completion_tokens":25,"prompt_tokens_details":{"cached_tokens":42}}}
+
+"#,
+        );
+        let _ = state.take_usage();
+        let text = String::from_utf8(state.finish().concat()).expect("utf-8");
+        assert!(text.contains("\"type\":\"response.completed\""));
+        assert!(text.contains("\"input_tokens\":90"));
+        assert!(text.contains("\"output_tokens\":25"));
+        assert!(text.contains("\"total_tokens\":115"));
+        assert!(text.contains("\"cached_tokens\":42"));
+        // Exactly one terminal event.
+        assert_eq!(text.matches("\"type\":\"response.completed\"").count(), 1);
+    }
+
+    #[test]
+    fn terminal_event_picks_up_usage_from_a_later_empty_choices_chunk() {
+        // opencode zen sends the finish chunk first, then a separate trailing
+        // usage chunk; the terminal event (emitted by `finish`) must use it.
+        let mut state = ChatStreamState::new("deepseek-v4-flash".into());
+        state.push(
+            br#"data: {"choices":[{"index":0,"delta":{"content":"hi"},"finish_reason":"stop"}]}
+
+"#,
+        );
+        state.push(
+            br#"data: {"choices":[],"usage":{"prompt_tokens":8,"completion_tokens":130,"prompt_tokens_details":{"cached_tokens":7}}}
+
+"#,
+        );
+        let _ = state.take_usage();
+        let text = String::from_utf8(state.finish().concat()).expect("utf-8");
+        assert!(text.contains("\"type\":\"response.completed\""));
+        assert!(text.contains("\"input_tokens\":8"));
+        assert!(text.contains("\"output_tokens\":130"));
+        assert!(text.contains("\"total_tokens\":138"));
+        assert!(text.contains("\"cached_tokens\":7"));
     }
 
     #[test]
@@ -989,9 +1138,11 @@ mod tests {
         assert!(!events.is_empty());
         let text = String::from_utf8(events.concat()).expect("utf-8");
         assert!(text.contains("\"sequence_number\":0"));
-        assert!(text.contains("\"sequence_number\":1"));
+        // The single terminal event is emitted by `finish`, not at the finish chunk.
+        assert!(!text.contains("\"type\":\"response.completed\""));
         let finish = String::from_utf8(state.finish().concat()).expect("utf-8");
-        assert!(finish.contains("\"sequence_number\":2"));
+        assert!(finish.contains("\"type\":\"response.completed\""));
+        assert!(finish.contains("\"sequence_number\":1"));
     }
 
     #[test]
