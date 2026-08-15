@@ -524,6 +524,7 @@ struct ChatStreamState {
     sequence_number: u64,
     model: String,
     reasoning_content: String,
+    reasoning_output_index: Option<u64>,
 }
 
 impl ChatStreamState {
@@ -649,6 +650,18 @@ impl ChatStreamState {
             if let Some(reasoning) = delta.get("reasoning_content").and_then(Value::as_str)
                 && !reasoning.is_empty()
             {
+                if self.reasoning_output_index.is_none() {
+                    self.reasoning_output_index = Some(self.output_index);
+                    self.output_index = self.output_index.saturating_add(1);
+                }
+                let output_index = self.reasoning_output_index.unwrap_or(0);
+                events.push(self.emit(json!({
+                    "type": "response.reasoning_text.delta",
+                    "item_id": "rs_openai_bridge",
+                    "output_index": output_index,
+                    "content_index": 0,
+                    "delta": reasoning
+                })));
                 self.reasoning_content.push_str(reasoning);
             }
             if let Some(content) = delta.get("content").and_then(Value::as_str)
@@ -696,8 +709,11 @@ impl ChatStreamState {
         let mut events = Vec::new();
         if !self.reasoning_content.is_empty() {
             let reasoning = std::mem::take(&mut self.reasoning_content);
-            let output_index = self.output_index;
-            self.output_index = self.output_index.saturating_add(1);
+            let output_index = self.reasoning_output_index.take().unwrap_or_else(|| {
+                let index = self.output_index;
+                self.output_index = self.output_index.saturating_add(1);
+                index
+            });
             events.push(self.emit(json!({
                 "type": "response.output_item.added",
                 "item_id": "rs_openai_bridge",
@@ -860,6 +876,30 @@ mod tests {
         // Each tool_call_id has a following tool response.
         let tool_ids = msgs.iter().filter_map(|m| m.get("role").and_then(Value::as_str).filter(|r| *r == "tool").map(|_| m.get("tool_call_id").and_then(Value::as_str))).collect::<Vec<_>>();
         assert_eq!(tool_ids, vec![Some("c1"), Some("c2")]);
+    }
+
+    #[test]
+    fn chat_stream_streams_reasoning_text_deltas() {
+        let mut state = ChatStreamState::new("deepseek-v4-flash".into());
+        let mut events = Vec::new();
+        events.extend(state.push(
+            br#"data: {"choices":[{"index":0,"delta":{"reasoning_content":"Think"},"finish_reason":null}]}
+
+"#,
+        ));
+        events.extend(state.push(
+            br#"data: {"choices":[{"index":0,"delta":{"reasoning_content":" step"},"finish_reason":null}]}
+
+"#,
+        ));
+        let text = String::from_utf8(events.concat()).expect("utf-8");
+        assert!(text.contains("\"type\":\"response.reasoning_text.delta\""));
+        assert!(text.contains("\"delta\":\"Think\""));
+        assert!(text.contains("\"delta\":\" step\""));
+        // The terminal reasoning item uses the same output_index as the stream.
+        let finish = String::from_utf8(state.flush_tool_calls().concat()).expect("utf-8");
+        assert!(finish.contains("\"type\":\"reasoning\""));
+        assert!(finish.contains("\"text\":\"Think step\""));
     }
 
     #[test]
