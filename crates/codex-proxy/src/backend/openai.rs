@@ -233,30 +233,63 @@ pub(super) fn transform_to_chat_completions(
 
     if let Some(input) = object.get("input").and_then(Value::as_array) {
         let mut pending_reasoning = String::new();
+        // Consecutive `function_call` items form ONE assistant tool-call turn;
+        // they must be merged so the resulting assistant `tool_calls` message is
+        // followed by the corresponding `tool` results (DeepSeek rejects an
+        // assistant tool_calls message without tool responses for each id).
+        let mut pending_tool_calls: Vec<Value> = Vec::new();
+        let flush_tool_calls = |messages: &mut Vec<Value>,
+                                tool_calls: &mut Vec<Value>,
+                                reasoning: &mut String| {
+            if tool_calls.is_empty() {
+                return;
+            }
+            let mut assistant = json!({ "role": "assistant", "tool_calls": std::mem::take(tool_calls) });
+            if !reasoning.is_empty() {
+                assistant["reasoning_content"] = Value::String(std::mem::take(reasoning));
+            }
+            messages.push(assistant);
+        };
         for item in input {
             let kind = item.get("type").and_then(Value::as_str).unwrap_or_default();
-            if kind == "reasoning" {
-                if let Some(text) = extract_reasoning_text(item) {
-                    pending_reasoning = text;
+            match kind {
+                "reasoning" => {
+                    if let Some(text) = extract_reasoning_text(item) {
+                        pending_reasoning = text;
+                    }
                 }
-                continue;
-            }
-            let mut message = map_input_item(item);
-            if !pending_reasoning.is_empty()
-                && let Some(msg) = message.as_mut()
-                && msg.get("role").and_then(Value::as_str) == Some("assistant")
-                && let Some(object) = msg.as_object_mut()
-            {
-                object.insert(
-                    "reasoning_content".into(),
-                    Value::String(pending_reasoning.clone()),
-                );
-                pending_reasoning.clear();
-            }
-            if let Some(message) = message {
-                messages.push(message);
+                "function_call" => {
+                    let id = item.get("call_id").and_then(Value::as_str);
+                    let name = item.get("name").and_then(Value::as_str);
+                    let arguments = item.get("arguments").and_then(Value::as_str).unwrap_or("");
+                    if let (Some(id), Some(name)) = (id, name) {
+                        pending_tool_calls.push(json!({
+                            "id": id,
+                            "type": "function",
+                            "function": { "name": name, "arguments": arguments }
+                        }));
+                    }
+                }
+                _ => {
+                    flush_tool_calls(&mut messages, &mut pending_tool_calls, &mut pending_reasoning);
+                    let mut message = map_input_item(item);
+                    if !pending_reasoning.is_empty()
+                        && let Some(msg) = message.as_mut()
+                        && msg.get("role").and_then(Value::as_str) == Some("assistant")
+                        && let Some(object) = msg.as_object_mut()
+                    {
+                        object.insert(
+                            "reasoning_content".into(),
+                            Value::String(std::mem::take(&mut pending_reasoning)),
+                        );
+                    }
+                    if let Some(message) = message {
+                        messages.push(message);
+                    }
+                }
             }
         }
+        flush_tool_calls(&mut messages, &mut pending_tool_calls, &mut pending_reasoning);
     }
 
     let mut chat = Map::new();
@@ -801,6 +834,30 @@ mod tests {
             assistant.get("reasoning_content").and_then(Value::as_str),
             Some("I should call the tool.")
         );
+    }
+
+    #[test]
+    fn transform_groups_consecutive_function_calls_into_one_assistant_message() {
+        let request = json!({
+            "model": "deepseek-v4-flash",
+            "input": [
+                {"type": "message", "role": "user", "content": [{"type": "input_text", "text": "hi"}]},
+                {"type": "function_call", "call_id": "c1", "name": "read", "arguments": "{}"},
+                {"type": "function_call", "call_id": "c2", "name": "ls", "arguments": "{}"},
+                {"type": "function_call_output", "call_id": "c1", "output": "a"},
+                {"type": "function_call_output", "call_id": "c2", "output": "b"}
+            ]
+        });
+        let chat = transform_to_chat_completions(&request, &config()).expect("transform");
+        let msgs = chat["messages"].as_array().expect("messages");
+        let assistant = msgs.iter().find(|m| m.get("role").and_then(Value::as_str) == Some("assistant")).expect("assistant");
+        let tool_calls = assistant["tool_calls"].as_array().expect("tool_calls");
+        assert_eq!(tool_calls.len(), 2);
+        assert_eq!(tool_calls[0]["id"], "c1");
+        assert_eq!(tool_calls[1]["id"], "c2");
+        // Each tool_call_id has a following tool response.
+        let tool_ids = msgs.iter().filter_map(|m| m.get("role").and_then(Value::as_str).filter(|r| *r == "tool").map(|_| m.get("tool_call_id").and_then(Value::as_str))).collect::<Vec<_>>();
+        assert_eq!(tool_ids, vec![Some("c1"), Some("c2")]);
     }
 
     #[test]
