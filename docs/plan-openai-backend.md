@@ -4,6 +4,20 @@
 
 ## 实现进度(更新于本次迭代)
 
+已完成(第六次迭代 — 兼容层硬化):
+- [x] `wire_format = "chat-completions" | "responses"` 显式化,`responses_api` 降级为别名;
+      非法值报 `ConfigError::InvalidEnumValue`(TOML 与 `.env` 一致)。
+- [x] `[backend.openai.compat] { stateless, supports_reasoning_effort, max_tokens_field }`:
+      `stateless = false` 保留 `previous_response_id`(OpenAI 状态化 Responses);无 reasoning
+      effort 的 provider 不发送/不广告(联动 `codex-protocol` 与 `models sync`)。
+- [x] `cache_policy = "explicit"` 注入 `prompt_cache_key`(请求体 key → `x-grok-session-id`);
+      `stable_prefix_fingerprint` 日志化(前缀稳定性监控,reasonix tool-schema-contract 对应物)。
+- [x] Chat 模式:并发工具调用测试锁定、`max_output_tokens` 转发(`max_tokens_field`)、
+      usage 缺失 `usage_estimated=true` 标记(保留 0,不估算)。
+- [x] `[backend.openai.cost]` 成本表 → 日志 `estimated_cost_usd`;`/health` 新增 `providers`。
+- [x] 新增 `docs/openai-provider-matrix.md` 能力矩阵;`cargo test --workspace` 全绿(150)、
+      `cargo clippy --workspace --all-targets` 无警告。详见 `docs/plan-openai-compat-hardening.md`。
+
 已完成:
 - [x] `config.rs`:`BackendKind` + `OpenAIBackendConfig` + TOML/`.env` 双源解析
       (`openai_backend_from_toml` / `openai_backend_from_env_file`,含 `${ENV}` 展开与
@@ -147,7 +161,7 @@ Grok 的上下文计数(上下文栏 `⇣Nk` / `/context`)用 `response.complete
 | 后端 | 上游协议 | 传输 | 凭据 | 缓存 | Web search |
 |------|----------|------|------|------|------------|
 | `codex`(现有) | Responses API | WebSocket(增量)+ HTTP/SSE 回退 | OAuth 会话 | 显式 `prompt_cache_key` | 通过 OAuth 后端 |
-| `openai`(新增) | OpenAI Chat `/chat/completions` | HTTP/SSE | 静态 `api_key` + `base_url` | 隐式前缀缓存 | provider 特定或禁用 |
+| `openai`(新增) | OpenAI Chat `/chat/completions` 或 Responses API(`responses_api = true` 时走 `/responses`) | HTTP/SSE | 静态 `api_key` + `base_url` | 隐式前缀缓存 | Chat 禁用 / Responses 启用(provider 服务端 `web_search`) |
 
 关键差异(参考 opencode 的实现):
 - opencode 中 `openai-compatible` 直接复用 OpenAI Chat 协议,只覆盖 `baseURL` + Bearer auth;
@@ -187,12 +201,12 @@ Grok Responses client
 │  prepare(request, ids) -> 线格式字节                        │
 │  send(prepared, auth) -> SSE 字节流                         │
 │  cache_policy() -> 显式 or 隐式(仅 codex 注入 key)          │
-└──────────┬────────────────────────────────┬─────────────────┘
+└──────────┬────────────────────────────────┬──────────────────────────┘
    Codex 后端                          OpenAI 兼容后端
-   - 变换→Responses                     - 变换→Chat/completions
+   - 变换→Responses                     - 变换→Chat 或直通→Responses
    - OAuth + WebSocket/SSE              - 静态 key + SSE
    - 注入 prompt_cache_key              - 不注入(隐式前缀)
-   - web_search 走 OAuth                - 禁用或 provider 特定
+   - web_search 走 OAuth                - Chat 禁用 / Responses 启用
 ```
 
 ## 4. 代码拆分(目标目录)
@@ -352,30 +366,39 @@ thinking = true
 
 ## 8. 迁移步骤(分阶段,每阶段可合并、可回滚)
 
-### 阶段 1 — 抽出共享壳(纯重构,行为不变)
-- [ ] 将鉴权/并发/body limit/model 白名单/`RequestDiagnostics`/`CompletionMetrics`/
-      `extract_cache_usage`/SSE 帧桥接/错误辅助移入共享模块,保持 `build_router` 签名兼容。
-- [ ] 现有测试全绿(`cargo test --workspace`),确认零行为变化。
+> 各阶段均已落地,完成状态以文首「实现进度」为准;本节按落地后的实际形态更新。
 
-### 阶段 2 — 引入 `UpstreamBackend` trait + Codex 实现
-- [ ] 定义 trait、`Backend` enum、`PreparedRequest`/`UpstreamAuth`/`BackendError`。
-- [ ] 把现有 WebSocket/SSE/OAuth/401 刷新/prompt_cache_key 逻辑迁到 `backend/codex.rs`,
-      `proxy_responses` 改为经 trait 分发。
-- [ ] 测试依旧全绿,作为回归基线。
+### 阶段 1 — 抽出共享壳(纯重构,行为不变)
+- [x] 将鉴权/并发/body limit/model 白名单/`RequestDiagnostics`/`CompletionMetrics`/
+      `extract_cache_usage`/SSE 帧桥接/错误辅助移入共享模块,保持 `build_router` 签名兼容。
+- [x] 现有测试全绿(`cargo test --workspace`),确认零行为变化。
+
+### 阶段 2 — Codex 后端抽取与分发
+- [x] 把现有 WebSocket/SSE/OAuth/401 刷新/prompt_cache_key 逻辑迁到 `backend/codex.rs`。
+- [x] 分发按 `openai_backend` 配置存在与否在 `proxy_responses` 直接分流
+      `handle_codex` / `handle_openai`(未引入 `UpstreamBackend` trait / `Backend` enum;
+      选择由 `BackendKind` + `select_openai_backend(model)` 承担)。
+- [x] 测试依旧全绿,作为回归基线。
 
 ### 阶段 3 — OpenAI 兼容后端 + 配置
-- [ ] `config.rs` 解析 TOML/.env,`Backend` 工厂按 `backend` 选择。
-- [ ] `backend/openai.rs`:Grok→ChatCompletions 变换(系统提示/tools/messages/stream)、
-      静态 key、SSE 消费、缓存统计直读、model 覆盖。
-- [ ] 用 mock 上游写集成测试:单轮/多轮工具循环、缓存命中字段、错误归一化。
+- [x] `config.rs` 解析 TOML/.env(`openai_backend_from_toml` / `openai_backend_from_env_file`,
+      `${ENV}` 展开、`OPENAI_API_KEY` / `DEEPSEEK_API_KEY` 回落);后端由配置存在与否选择。
+- [x] `backend/openai.rs` 双模式:Grok→ChatCompletions 变换(系统提示/tools/messages/stream)、
+      静态 key、SSE 消费、缓存统计直读、model 覆盖;`responses_api = true` 时改直通
+      `{base_url}/responses`(复用 codex-protocol 变换与 `CodexSseTransformer` 桥,
+      `x_search`→`web_search` 映射,剥掉 `previous_response_id` / `prompt_cache_key` /
+      `include` 等 Codex 专属字段)。
+- [x] 用 mock 上游写集成测试:单轮/多轮工具循环、缓存命中字段、错误归一化
+      (`tests/openai_backend.rs` + `config.rs` 模块单测)。
 
 ### 阶段 4 — 收尾
 - [x] web_search 在 openai 模式的禁用/白名单逻辑 + 文档:
       `responses_api = true` 走 provider 的 `/responses`(DeepSeek 原生 Responses API),
       复用 codex-protocol 的 `x_search`→`web_search` 映射与 `CodexSseTransformer` 桥;
       `web_search` 默认跟随 `responses_api`,可显式 `web_search = false` 关闭。
-- [ ] 更新 `architecture.md`、README(双后端对比表、配置示例)。
-- [ ] 端到端联调:`grok-codex-oauth` 新增 `--backend` 入口与 `ensure-daemon` 生效。
+- [x] 更新 `architecture.md`、README(双后端对比表、配置示例)。
+- [x] 端到端联调:daemon 从 `proxy.toml`(或 `backend.env`)读取并注入 `with_openai_backend`;
+      后端由配置存在与否选择(无 `--backend` 入口)。
 
 ## 9. 测试策略
 

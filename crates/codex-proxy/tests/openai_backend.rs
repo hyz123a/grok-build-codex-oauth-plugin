@@ -1,3 +1,4 @@
+use std::io::{self, Write};
 use std::sync::{Arc, Mutex as StdMutex, atomic::AtomicUsize};
 
 use async_trait::async_trait;
@@ -15,6 +16,7 @@ use codex_proxy::{
 };
 use http_body_util::BodyExt;
 use serde_json::{Value, json};
+use tracing_subscriber::fmt::MakeWriter;
 
 #[derive(Clone, Default)]
 struct Captures(Arc<StdMutex<Vec<Value>>>);
@@ -84,7 +86,10 @@ fn openai_config(base_url: String) -> OpenAIBackendConfig {
         thinking: None,
         reasoning_efforts: Vec::new(),
         default_reasoning_effort: None,
-        responses_api: false,
+        wire_format: codex_proxy::WireFormat::ChatCompletions,
+        compat: codex_proxy::CompatFlags::default(),
+        cache_policy: codex_proxy::CachePolicy::Implicit,
+        cost: None,
         web_search: false,
         extra_headers: std::collections::HashMap::new(),
     }
@@ -363,7 +368,7 @@ async fn openai_responses_mode_forwards_web_search_and_bridges_back() {
     let captures = Captures::default();
     let base_url = spawn_openai_responses_upstream(captures.clone()).await;
     let mut config = openai_config(base_url);
-    config.responses_api = true;
+    config.wire_format = codex_proxy::WireFormat::Responses;
     config.web_search = true;
     config.default_model = Some("deepseek-v4-flash".into());
     let app = build_router(
@@ -418,7 +423,7 @@ async fn openai_responses_mode_drops_web_search_when_disabled() {
     let captures = Captures::default();
     let base_url = spawn_openai_responses_upstream(captures.clone()).await;
     let mut config = openai_config(base_url);
-    config.responses_api = true;
+    config.wire_format = codex_proxy::WireFormat::Responses;
     config.web_search = false;
     config.default_model = Some("deepseek-v4-flash".into());
     let app = build_router(
@@ -451,4 +456,257 @@ async fn openai_responses_mode_drops_web_search_when_disabled() {
     let captured = captures.0.lock().expect("captures");
     let tools = captured[0]["tools"].as_array().expect("tools");
     assert!(tools.is_empty(), "web_search must be dropped when disabled");
+}
+
+/// Mock upstream that returns two parallel `tool_calls` in a single chunk.
+async fn openai_upstream_tool_calls(State(captures): State<Captures>, body: String) -> Response {
+    let value: Value = serde_json::from_str(&body).expect("json");
+    captures.0.lock().expect("captures").push(value);
+    let stream = "data: {\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call_1\",\"type\":\"function\",\"function\":{\"name\":\"read\",\"arguments\":\"{}\"}},{\"index\":1,\"id\":\"call_2\",\"type\":\"function\",\"function\":{\"name\":\"ls\",\"arguments\":\"{}\"}}]},\"finish_reason\":null}]}\n\n\
+data: {\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"tool_calls\"}],\"usage\":{\"prompt_tokens\":20,\"prompt_tokens_details\":{\"cached_tokens\":10},\"completion_tokens\":4}}\n\n\
+data: [DONE]\n\n";
+    Response::builder()
+        .status(StatusCode::OK)
+        .header("content-type", "text/event-stream")
+        .body(Body::from(stream))
+        .expect("response")
+}
+
+/// Mock upstream that never reports usage (some Chat providers omit it).
+async fn openai_upstream_no_usage(State(captures): State<Captures>, body: String) -> Response {
+    let value: Value = serde_json::from_str(&body).expect("json");
+    captures.0.lock().expect("captures").push(value);
+    let stream = "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"Hi\"},\"finish_reason\":null}]}\n\n\
+data: {\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n\
+data: [DONE]\n\n";
+    Response::builder()
+        .status(StatusCode::OK)
+        .header("content-type", "text/event-stream")
+        .body(Body::from(stream))
+        .expect("response")
+}
+
+async fn spawn_openai_upstream_with(
+    captures: Captures,
+    route: axum::routing::MethodRouter<Captures>,
+) -> String {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind");
+    let address = listener.local_addr().expect("addr");
+    tokio::spawn(async move {
+        axum::serve(
+            listener,
+            Router::new().route("/chat/completions", route).with_state(captures),
+        )
+        .await
+        .expect("server");
+    });
+    format!("http://{address}")
+}
+
+#[tokio::test]
+async fn openai_backend_bridges_parallel_tool_calls_into_responses_output() {
+    let captures = Captures::default();
+    let base_url =
+        spawn_openai_upstream_with(captures.clone(), post(openai_upstream_tool_calls)).await;
+    let app = build_router(
+        ProxyConfig::for_test("http://127.0.0.1/invalid", "local-secret")
+            .with_openai_backend(openai_config(base_url)),
+        Arc::new(StubCredentials::default()),
+    )
+    .expect("router");
+
+    let response = tower::ServiceExt::oneshot(
+        app,
+        axum::http::Request::post("/v1/responses")
+            .header("authorization", "Bearer local-secret")
+            .header("content-type", "application/json")
+            .body(Body::from(
+                json!({
+                    "model": "deepseek-chat",
+                    "input": [{"type": "message", "role": "user", "content": [{"type": "input_text", "text": "list and read"}]}]
+                })
+                .to_string(),
+            ))
+            .expect("request"),
+    )
+    .await
+    .expect("response");
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = collect_body(response).await;
+    assert_eq!(
+        body.matches("\"type\":\"response.output_item.added\"").count(),
+        2,
+        "both parallel tool calls must be bridged as added items"
+    );
+    assert!(body.contains("\"name\":\"read\""));
+    assert!(body.contains("\"name\":\"ls\""));
+    assert_eq!(
+        body.matches("\"type\":\"response.function_call_arguments.done\"").count(),
+        2,
+        "each tool call must complete its arguments"
+    );
+    assert!(body.contains("\"type\":\"response.completed\""));
+}
+
+#[tokio::test]
+async fn openai_backend_forwards_max_output_tokens_as_max_tokens() {
+    let captures = Captures::default();
+    let base_url = spawn_openai_upstream(captures.clone()).await;
+    let app = build_router(
+        ProxyConfig::for_test("http://127.0.0.1/invalid", "local-secret")
+            .with_openai_backend(openai_config(base_url)),
+        Arc::new(StubCredentials::default()),
+    )
+    .expect("router");
+
+    let response = tower::ServiceExt::oneshot(
+        app,
+        axum::http::Request::post("/v1/responses")
+            .header("authorization", "Bearer local-secret")
+            .header("content-type", "application/json")
+            .body(Body::from(
+                json!({
+                    "model": "deepseek-chat",
+                    "max_output_tokens": 2048,
+                    "input": [{"type": "message", "role": "user", "content": "hi"}]
+                })
+                .to_string(),
+            ))
+            .expect("request"),
+    )
+    .await
+    .expect("response");
+    assert_eq!(response.status(), StatusCode::OK);
+    drop(collect_body(response).await);
+
+    let captured = captures.0.lock().expect("captures");
+    assert_eq!(captured[0]["max_tokens"], 2048);
+}
+
+#[derive(Clone, Default)]
+struct LogCapture(Arc<StdMutex<Vec<u8>>>);
+
+struct LogWriter(LogCapture);
+
+impl Write for LogWriter {
+    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+        self.0
+            .0
+            .lock()
+            .expect("log capture lock")
+            .extend_from_slice(bytes);
+        Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+}
+
+impl<'writer> MakeWriter<'writer> for LogCapture {
+    type Writer = LogWriter;
+
+    fn make_writer(&'writer self) -> Self::Writer {
+        LogWriter(self.clone())
+    }
+}
+
+impl LogCapture {
+    fn contents(&self) -> String {
+        String::from_utf8(self.0.lock().expect("log capture lock").clone())
+            .expect("UTF-8 tracing output")
+    }
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn openai_backend_logs_usage_estimated_when_upstream_omits_usage() {
+    let captures = Captures::default();
+    let base_url = spawn_openai_upstream_with(captures.clone(), post(openai_upstream_no_usage)).await;
+    let app = build_router(
+        ProxyConfig::for_test("http://127.0.0.1/invalid", "local-secret")
+            .with_openai_backend(openai_config(base_url)),
+        Arc::new(StubCredentials::default()),
+    )
+    .expect("router");
+    let logs = LogCapture::default();
+    let subscriber = tracing_subscriber::fmt()
+        .with_ansi(false)
+        .without_time()
+        .with_writer(logs.clone())
+        .finish();
+    tracing::subscriber::set_global_default(subscriber).expect("install tracing capture");
+
+    let response = tower::ServiceExt::oneshot(
+        app,
+        axum::http::Request::post("/v1/responses")
+            .header("authorization", "Bearer local-secret")
+            .header("content-type", "application/json")
+            .body(Body::from(json!({"model": "deepseek-chat", "input": []}).to_string()))
+            .expect("request"),
+    )
+    .await
+    .expect("response");
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = response
+        .into_body()
+        .collect()
+        .await
+        .expect("body")
+        .to_bytes();
+    assert!(
+        body.windows(b"response.completed".len())
+            .any(|window| window == b"response.completed")
+    );
+
+    let logs = logs.contents();
+    assert!(logs.contains("upstream stream omitted usage"));
+    assert!(logs.contains("usage_estimated=true"));
+    assert!(logs.contains("estimated_cost_usd=\"<none>\""));
+}
+
+#[tokio::test]
+async fn health_reports_openai_providers_with_cost() {
+    let captures = Captures::default();
+    let base_url = spawn_openai_upstream(captures.clone()).await;
+    let mut config = openai_config(base_url);
+    config.cost = Some(codex_proxy::Cost {
+        input: 0.27,
+        output: 1.10,
+        cache_read: 0.07,
+        cache_write: 0.27,
+    });
+    let app = build_router(
+        ProxyConfig::for_test("http://127.0.0.1/invalid", "local-secret")
+            .with_openai_backend(config),
+        Arc::new(StubCredentials::default()),
+    )
+    .expect("router");
+
+    let response = tower::ServiceExt::oneshot(
+        app,
+        axum::http::Request::get("/health")
+            .body(Body::empty())
+            .expect("request"),
+    )
+    .await
+    .expect("response");
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = response
+        .into_body()
+        .collect()
+        .await
+        .expect("body")
+        .to_bytes();
+    let health: Value = serde_json::from_slice(&body).expect("health JSON");
+    assert_eq!(health["backend"], "openai");
+    let providers = health["providers"].as_array().expect("providers array");
+    assert_eq!(providers.len(), 1);
+    assert_eq!(providers[0]["name"], "<default>");
+    assert_eq!(providers[0]["wire_format"], "chat-completions");
+    assert_eq!(providers[0]["cache_policy"], "implicit");
+    assert_eq!(providers[0]["cost"]["input"], 0.27);
+    assert_eq!(providers[0]["cost"]["output"], 1.10);
 }

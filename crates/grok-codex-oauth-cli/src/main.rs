@@ -380,12 +380,23 @@ async fn sync_openai_models(
             if models.iter().any(|model: &CatalogModel| model.slug == slug) {
                 continue;
             }
+            // Providers without a reasoning-effort parameter must not advertise
+            // reasoning to Grok (no thinking UI, no effort clamp upstream).
+            let (default_reasoning_effort, supported_reasoning_efforts) =
+                if provider.compat.supports_reasoning_effort {
+                    (
+                        provider.default_reasoning_effort.clone(),
+                        provider.reasoning_efforts.clone(),
+                    )
+                } else {
+                    (None, Vec::new())
+                };
             models.push(CatalogModel {
                 display_name: slug.clone(),
                 context_window: provider.model_context_windows.get(&slug).copied(),
                 slug,
-                default_reasoning_effort: provider.default_reasoning_effort.clone(),
-                supported_reasoning_efforts: provider.reasoning_efforts.clone(),
+                default_reasoning_effort,
+                supported_reasoning_efforts,
             });
         }
     }

@@ -308,6 +308,9 @@ fn mark_item_completed(mut item: Value) -> Value {
 pub struct TransformOptions {
     pub allowed_reasoning_efforts: Vec<String>,
     pub default_reasoning_effort: String,
+    /// Providers without a reasoning-effort parameter skip the effort clamp
+    /// (and the proxy does not advertise reasoning to Grok for them).
+    pub supports_reasoning_effort: bool,
 }
 
 impl Default for TransformOptions {
@@ -323,6 +326,7 @@ impl Default for TransformOptions {
                 "max".into(),
             ],
             default_reasoning_effort: "high".into(),
+            supports_reasoning_effort: true,
         }
     }
 }
@@ -377,7 +381,8 @@ pub fn transform_responses_request(
         }
     }
 
-    if let Some(reasoning) = object.get_mut("reasoning").and_then(Value::as_object_mut)
+    if options.supports_reasoning_effort
+        && let Some(reasoning) = object.get_mut("reasoning").and_then(Value::as_object_mut)
         && let Some(effort) = reasoning.get("effort").and_then(Value::as_str)
         && !options
             .allowed_reasoning_efforts

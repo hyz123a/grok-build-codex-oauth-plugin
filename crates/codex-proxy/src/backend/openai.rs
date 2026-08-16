@@ -1,10 +1,14 @@
-//! OpenAI Chat `/chat/completions` compatible backend.
+//! OpenAI-compatible backend (Chat `/chat/completions` and Responses
+//! `/responses`).
 //!
-//! Translates Grok's Responses-format request into an OpenAI Chat request and
-//! bridges the provider's SSE stream back into the Responses-format SSE events
-//! that Grok's decoder accepts. Caching is the provider's implicit prefix
-//! caching; no explicit `prompt_cache_key` is emitted. Web search (`x_search`)
-//! is not available on this backend and is dropped from the request.
+//! Chat mode translates Grok's Responses-format request into an OpenAI Chat
+//! request and bridges the provider's SSE stream back into the Responses-format
+//! SSE events that Grok's decoder accepts. Responses mode forwards the body
+//! nearly as-is (DeepSeek) with `x_search` mapped to the provider's
+//! `web_search` tool. Caching defaults to the provider's implicit prefix
+//! caching; `cache_policy = "explicit"` opts into an explicit
+//! `prompt_cache_key` (Responses mode only). Per-provider compatibility flags
+//! (`CompatFlags`) parameterize DeepSeek-specific assumptions.
 
 use std::collections::HashMap;
 
@@ -23,13 +27,14 @@ use crate::{
     sanitize_error_body,
 };
 
-use super::super::config::OpenAIBackendConfig;
+use super::super::config::{CachePolicy, Cost, MaxTokensField, OpenAIBackendConfig, WireFormat};
 
 pub(crate) async fn handle_openai(
     state: &crate::AppState,
     headers: &HeaderMap,
     request: &Value,
     client_request_id: &str,
+    session_id: Option<&str>,
 ) -> Response {
     let started_at = std::time::Instant::now();
     // Select the provider by model-name prefix; the default provider serves any
@@ -42,8 +47,9 @@ pub(crate) async fn handle_openai(
     // Responses API mode: forward the Grok Responses body to the provider's
     // `/responses` endpoint (DeepSeek), where server-side `web_search` and other
     // Responses-native capabilities are available.
-    if config.responses_api {
-        return handle_openai_responses(state, headers, request, client_request_id, config).await;
+    if config.wire_format == WireFormat::Responses {
+        return handle_openai_responses(state, headers, request, client_request_id, session_id, config)
+            .await;
     }
 
     let chat_request = match transform_to_chat_completions(request, config) {
@@ -134,7 +140,13 @@ pub(crate) async fn handle_openai(
     }
 
     let upstream_request_id = header_value(&source_headers, "x-request-id");
-    let stream = bridge_openai_sse(upstream, diagnostics, upstream_request_id, model.to_owned());
+    let stream = bridge_openai_sse(
+        upstream,
+        diagnostics,
+        upstream_request_id,
+        model.to_owned(),
+        config.cost,
+    );
     let mut response = Response::new(Body::from_stream(stream));
     *response.status_mut() = StatusCode::OK;
     copy_response_headers(&source_headers, &mut response);
@@ -157,10 +169,11 @@ async fn handle_openai_responses(
     headers: &HeaderMap,
     request: &Value,
     client_request_id: &str,
+    session_id: Option<&str>,
     config: &OpenAIBackendConfig,
 ) -> Response {
     let started_at = std::time::Instant::now();
-    let transformed = match transform_to_responses_api(request, config) {
+    let transformed = match transform_to_responses_api(request, config, session_id) {
         Ok(transformed) => transformed,
         Err(message) => return error_response(StatusCode::BAD_REQUEST, &message),
     };
@@ -215,7 +228,7 @@ async fn handle_openai_responses(
     // The upstream already speaks Responses-format SSE, so reuse the Codex
     // backend's bridge (`stream_response`), which runs the `CodexSseTransformer`
     // and fills `web_search_call` actions plus the terminal `output` array.
-    crate::stream_response(upstream, diagnostics).await
+    crate::stream_response(upstream, diagnostics, config.cost).await
 }
 
 /// Translate a Grok Responses request for a provider that speaks the Responses
@@ -226,6 +239,7 @@ async fn handle_openai_responses(
 pub(super) fn transform_to_responses_api(
     request: &Value,
     config: &OpenAIBackendConfig,
+    session_id: Option<&str>,
 ) -> Result<Value, String> {
     let model = resolve_upstream_model(request, config)?;
     let options = transform_options(config);
@@ -236,12 +250,15 @@ pub(super) fn transform_to_responses_api(
         return Err("request body must be a JSON object".to_string());
     };
     object.insert("model".into(), Value::String(model));
-    // DeepSeek's Responses API is stateless and silently ignores unsupported
-    // fields; drop the ones that carry Codex-specific meaning so nothing
-    // confusing leaks upstream.
-    object.remove("previous_response_id");
-    object.remove("prompt_cache_key");
+    // Stateless Responses providers (e.g. DeepSeek) silently ignore
+    // `previous_response_id`; stateful ones (e.g. OpenAI) need it for
+    // server-side session continuity, so only strip it for stateless providers.
+    if config.compat.stateless {
+        object.remove("previous_response_id");
+    }
+    // `include` is a Grok-private request field with no upstream meaning.
     object.remove("include");
+    apply_cache_policy(request, config, session_id, object);
     dedupe_tools(object);
     if !config.web_search {
         drop_search_tools(object);
@@ -252,12 +269,48 @@ pub(super) fn transform_to_responses_api(
     Ok(transformed)
 }
 
+/// Enforce the configured cache policy on a Responses-mode request body.
+/// Implicit (default) never emits `prompt_cache_key`; explicit injects one
+/// from the request body or the `x-grok-session-id` header, falling back to
+/// implicit caching (with a warning) when neither is available.
+fn apply_cache_policy(
+    request: &Value,
+    config: &OpenAIBackendConfig,
+    session_id: Option<&str>,
+    object: &mut serde_json::Map<String, Value>,
+) {
+    if config.cache_policy != CachePolicy::Explicit {
+        object.remove("prompt_cache_key");
+        return;
+    }
+    let key = request
+        .get("prompt_cache_key")
+        .and_then(Value::as_str)
+        .filter(|key| !key.is_empty())
+        .map(str::to_owned)
+        .or_else(|| session_id.filter(|id| !id.is_empty()).map(str::to_owned));
+    match key {
+        Some(key) => {
+            object.insert("prompt_cache_key".into(), Value::String(key));
+        }
+        None => {
+            tracing::warn!(
+                provider = config.name.as_deref().unwrap_or("<default>"),
+                "cache_policy = explicit but the request carries no prompt_cache_key and no session id; fell back to implicit caching"
+            );
+        }
+    }
+}
+
 /// Build the `TransformOptions` used by the codex-protocol transform from the
 /// provider's configured reasoning efforts (falling back to codex defaults).
 fn transform_options(config: &OpenAIBackendConfig) -> codex_protocol::TransformOptions {
     let default = codex_protocol::TransformOptions::default();
     if config.reasoning_efforts.is_empty() {
-        default
+        codex_protocol::TransformOptions {
+            supports_reasoning_effort: config.compat.supports_reasoning_effort,
+            ..default
+        }
     } else {
         codex_protocol::TransformOptions {
             allowed_reasoning_efforts: config.reasoning_efforts.clone(),
@@ -265,6 +318,7 @@ fn transform_options(config: &OpenAIBackendConfig) -> codex_protocol::TransformO
                 .default_reasoning_effort
                 .clone()
                 .unwrap_or_else(|| default.default_reasoning_effort.clone()),
+            supports_reasoning_effort: config.compat.supports_reasoning_effort,
         }
     }
 }
@@ -389,6 +443,11 @@ fn apply_thinking(config: &OpenAIBackendConfig, object: &mut serde_json::Map<Str
     let Some(thinking) = config.thinking else {
         return;
     };
+    // Providers without a reasoning-effort parameter cannot honor effort-based
+    // thinking control; leave the request untouched.
+    if !config.compat.supports_reasoning_effort {
+        return;
+    }
     let reasoning = object
         .entry("reasoning")
         .or_insert_with(|| Value::Object(serde_json::Map::new()));
@@ -612,6 +671,16 @@ pub(super) fn transform_to_chat_completions(
         }
         None => {}
     }
+    // Forward Grok's output-token budget onto the provider's field of choice
+    // (`max_tokens` by default, `max_completion_tokens` for providers that
+    // reject the legacy name).
+    if let Some(max_output_tokens) = object.get("max_output_tokens").and_then(Value::as_u64) {
+        let field = match config.compat.max_tokens_field {
+            MaxTokensField::MaxTokens => "max_tokens",
+            MaxTokensField::MaxCompletionTokens => "max_completion_tokens",
+        };
+        chat.insert(field.into(), Value::from(max_output_tokens));
+    }
     Ok(Value::Object(chat))
 }
 
@@ -706,6 +775,7 @@ fn bridge_openai_sse(
     diagnostics: RequestDiagnostics,
     upstream_request_id: String,
     model: String,
+    cost: Option<Cost>,
 ) -> impl futures_util::Stream<Item = Result<Bytes, std::io::Error>> {
     let source = upstream.bytes_stream();
     async_stream::stream! {
@@ -738,8 +808,14 @@ fn bridge_openai_sse(
                     for remainder in transformer.finish() {
                         yield Ok(Bytes::from(remainder));
                     }
+                    let usage_seen = state.final_usage().is_some();
+                    let estimated_cost_usd = cost.map(|cost| {
+                        estimate_cost_usd(cost, input_tokens, cached_input_tokens, state.final_usage())
+                    });
                     diagnostics.log_completed("transport_error", &upstream_request_id, None, CompletionMetrics {
                         bytes_received, chunks_received, filtered_keepalive_events, input_tokens, cached_input_tokens,
+                        usage_estimated: !usage_seen,
+                        estimated_cost_usd,
                     });
                     yield Err(std::io::Error::other(error));
                     return;
@@ -815,10 +891,41 @@ fn bridge_openai_sse(
         } else {
             "completed"
         };
+        let usage_seen = state.final_usage().is_some();
+        if !usage_seen {
+            tracing::warn!(
+                client_request_id = diagnostics.client_request_id.as_str(),
+                upstream_request_id = upstream_request_id.as_str(),
+                model = model.as_str(),
+                "OpenAI-compatible upstream stream omitted usage; output tokens reported as 0"
+            );
+        }
+        let estimated_cost_usd = cost.map(|cost| {
+            estimate_cost_usd(cost, input_tokens, cached_input_tokens, state.final_usage())
+        });
         diagnostics.log_completed(outcome, &upstream_request_id, sse_error_type.as_deref(), CompletionMetrics {
             bytes_received, chunks_received, filtered_keepalive_events, input_tokens, cached_input_tokens,
+            usage_estimated: !usage_seen,
+            estimated_cost_usd,
         });
     }
+}
+
+/// Estimate the USD cost of a completed request from the provider's price
+/// table and the reported token counts. Cached input tokens are billed at the
+/// cache-read rate instead of the input rate; `cache_write` is reserved (the
+/// proxy does not track write tokens yet).
+fn estimate_cost_usd(
+    cost: Cost,
+    input_tokens: Option<u64>,
+    cached_input_tokens: Option<u64>,
+    usage: Option<StreamUsage>,
+) -> f64 {
+    let input = input_tokens.unwrap_or(0) as f64;
+    let cached = cached_input_tokens.unwrap_or(0) as f64;
+    let output = usage.map(|usage| usage.output_tokens).unwrap_or(0) as f64;
+    ((input - cached).max(0.0) * cost.input + cached * cost.cache_read + output * cost.output)
+        / 1_000_000.0
 }
 
 fn diagnostics_log_transport(diagnostics: &RequestDiagnostics, upstream_request_id: &str, model: &str) {
@@ -920,6 +1027,11 @@ impl ChatStreamState {
     /// Take any cache usage reported by a trailing stream chunk.
     fn take_usage(&mut self) -> Option<(u64, u64)> {
         self.pending_usage.take()
+    }
+
+    /// Usage seen on the final trailing chunk, if the provider reported any.
+    fn final_usage(&self) -> Option<StreamUsage> {
+        self.final_usage
     }
 
     fn terminal_event(&mut self) -> Vec<u8> {
@@ -1168,6 +1280,7 @@ fn find_sse_delimiter(buffer: &[u8]) -> Option<(usize, usize)> {
 
 #[cfg(test)]
 mod tests {
+    use super::super::super::config::CompatFlags;
     use super::*;
 
     fn config() -> OpenAIBackendConfig {
@@ -1181,7 +1294,10 @@ mod tests {
             thinking: None,
             reasoning_efforts: Vec::new(),
             default_reasoning_effort: None,
-            responses_api: false,
+            wire_format: WireFormat::ChatCompletions,
+            compat: CompatFlags::default(),
+            cache_policy: CachePolicy::Implicit,
+            cost: None,
             web_search: false,
             extra_headers: HashMap::new(),
         }
@@ -1353,7 +1469,7 @@ mod tests {
     #[test]
     fn responses_mode_maps_x_search_to_web_search_when_enabled() {
         let mut responses = config();
-        responses.responses_api = true;
+        responses.wire_format = WireFormat::Responses;
         responses.web_search = true;
         let request = json!({
             "model": "deepseek-v4-flash",
@@ -1366,7 +1482,7 @@ mod tests {
             "prompt_cache_key": "cache-1",
             "include": ["file_search_call.results"]
         });
-        let transformed = transform_to_responses_api(&request, &responses).expect("transform");
+        let transformed = transform_to_responses_api(&request, &responses, None).expect("transform");
         assert_eq!(transformed["model"], "deepseek-v4-flash");
         assert_eq!(transformed["stream"], true);
         assert_eq!(transformed["store"], false);
@@ -1383,7 +1499,7 @@ mod tests {
     #[test]
     fn responses_mode_drops_web_search_when_disabled() {
         let mut responses = config();
-        responses.responses_api = true;
+        responses.wire_format = WireFormat::Responses;
         responses.web_search = false;
         let request = json!({
             "model": "deepseek-v4-flash",
@@ -1393,7 +1509,7 @@ mod tests {
             ],
             "tools": [{"type": "x_search"}]
         });
-        let transformed = transform_to_responses_api(&request, &responses).expect("transform");
+        let transformed = transform_to_responses_api(&request, &responses, None).expect("transform");
         let tools = transformed["tools"].as_array().expect("tools");
         assert!(tools.is_empty(), "web_search tool must be dropped when disabled");
         let input = transformed["input"].as_array().expect("input");
@@ -1403,7 +1519,7 @@ mod tests {
     #[test]
     fn responses_mode_normalizes_search_input_items_to_queries() {
         let mut responses = config();
-        responses.responses_api = true;
+        responses.wire_format = WireFormat::Responses;
         responses.web_search = true;
         let request = json!({
             "model": "deepseek-v4-flash",
@@ -1413,7 +1529,7 @@ mod tests {
                  "action": {"type": "search", "query": "Rust latest release"}}
             ]
         });
-        let transformed = transform_to_responses_api(&request, &responses).expect("transform");
+        let transformed = transform_to_responses_api(&request, &responses, None).expect("transform");
         let search = transformed["input"]
             .as_array()
             .expect("input")
@@ -1430,7 +1546,7 @@ mod tests {
     #[test]
     fn responses_mode_normalizes_action_less_search_input_item() {
         let mut responses = config();
-        responses.responses_api = true;
+        responses.wire_format = WireFormat::Responses;
         responses.web_search = true;
         // Grok echoes an in-progress search without an action; DeepSeek's
         // deserializer requires the action object.
@@ -1441,7 +1557,7 @@ mod tests {
                 {"type": "web_search_call", "id": "ws-1", "status": "in_progress"}
             ]
         });
-        let transformed = transform_to_responses_api(&request, &responses).expect("transform");
+        let transformed = transform_to_responses_api(&request, &responses, None).expect("transform");
         let search = transformed["input"]
             .as_array()
             .expect("input")
@@ -1456,7 +1572,7 @@ mod tests {
     #[test]
     fn responses_mode_normalizes_object_queries_to_strings() {
         let mut responses = config();
-        responses.responses_api = true;
+        responses.wire_format = WireFormat::Responses;
         responses.web_search = true;
         // A echoed item whose queries are objects (not strings) must be coerced
         // to plain strings for DeepSeek's deserializer.
@@ -1468,7 +1584,7 @@ mod tests {
                  "action": {"type": "search", "queries": [{"query": "first"}, {"text": "second"}]}}
             ]
         });
-        let transformed = transform_to_responses_api(&request, &responses).expect("transform");
+        let transformed = transform_to_responses_api(&request, &responses, None).expect("transform");
         let search = transformed["input"]
             .as_array()
             .expect("input")
@@ -1484,7 +1600,7 @@ mod tests {
     #[test]
     fn responses_mode_leaves_open_page_echo_untouched() {
         let mut responses = config();
-        responses.responses_api = true;
+        responses.wire_format = WireFormat::Responses;
         responses.web_search = true;
         // open_page actions carry a url, not queries; DeepSeek accepts them
         // as-is, so normalization must not add a bogus queries list.
@@ -1496,7 +1612,7 @@ mod tests {
                  "action": {"type": "open_page", "url": "https://blog.rust-lang.org"}}
             ]
         });
-        let transformed = transform_to_responses_api(&request, &responses).expect("transform");
+        let transformed = transform_to_responses_api(&request, &responses, None).expect("transform");
         let search = transformed["input"]
             .as_array()
             .expect("input")
@@ -1511,20 +1627,20 @@ mod tests {
     #[test]
     fn responses_mode_thinking_false_sets_effort_none() {
         let mut responses = config();
-        responses.responses_api = true;
+        responses.wire_format = WireFormat::Responses;
         responses.thinking = Some(false);
         let request = json!({
             "model": "deepseek-v4-flash",
             "input": [{"type": "message", "role": "user", "content": "hi"}]
         });
-        let transformed = transform_to_responses_api(&request, &responses).expect("transform");
+        let transformed = transform_to_responses_api(&request, &responses, None).expect("transform");
         assert_eq!(transformed["reasoning"]["effort"], "none");
     }
 
     #[test]
     fn responses_mode_dedupes_tools_by_name() {
         let mut responses = config();
-        responses.responses_api = true;
+        responses.wire_format = WireFormat::Responses;
         responses.web_search = true;
         let request = json!({
             "model": "deepseek-v4-flash",
@@ -1536,7 +1652,7 @@ mod tests {
                 {"type": "web_search"}
             ]
         });
-        let transformed = transform_to_responses_api(&request, &responses).expect("transform");
+        let transformed = transform_to_responses_api(&request, &responses, None).expect("transform");
         let tools = transformed["tools"].as_array().expect("tools");
         let names: Vec<&str> = tools
             .iter()
@@ -1699,5 +1815,190 @@ mod tests {
         assert!(text.contains("\"arguments\":\"{\\\"city\\\":\\\"SF\\\"}\""));
         assert!(text.contains("\"type\":\"response.function_call_arguments.done\""));
         assert!(text.contains("\"type\":\"response.completed\""));
+    }
+
+    #[test]
+    fn responses_transform_keeps_previous_response_id_when_stateful() {
+        let mut responses = config();
+        responses.wire_format = WireFormat::Responses;
+        responses.compat.stateless = false;
+        let request = json!({
+            "model": "deepseek-v4-flash",
+            "previous_response_id": "resp_123",
+            "input": [{"type": "message", "role": "user", "content": "hi"}]
+        });
+        let transformed = transform_to_responses_api(&request, &responses, None).expect("transform");
+        assert_eq!(transformed["previous_response_id"], "resp_123");
+    }
+
+    #[test]
+    fn responses_transform_strips_previous_response_id_when_stateless() {
+        let mut responses = config();
+        responses.wire_format = WireFormat::Responses;
+        assert!(responses.compat.stateless, "stateless is the default");
+        let request = json!({
+            "model": "deepseek-v4-flash",
+            "previous_response_id": "resp_123",
+            "input": [{"type": "message", "role": "user", "content": "hi"}]
+        });
+        let transformed = transform_to_responses_api(&request, &responses, None).expect("transform");
+        assert!(transformed.get("previous_response_id").is_none());
+    }
+
+    #[test]
+    fn responses_transform_injects_prompt_cache_key_when_explicit() {
+        let mut responses = config();
+        responses.wire_format = WireFormat::Responses;
+        responses.cache_policy = CachePolicy::Explicit;
+        let request = json!({
+            "model": "deepseek-v4-flash",
+            "input": [{"type": "message", "role": "user", "content": "hi"}]
+        });
+        let transformed =
+            transform_to_responses_api(&request, &responses, Some("grok-session-42")).expect("transform");
+        assert_eq!(transformed["prompt_cache_key"], "grok-session-42");
+    }
+
+    #[test]
+    fn responses_transform_prefers_request_prompt_cache_key() {
+        let mut responses = config();
+        responses.wire_format = WireFormat::Responses;
+        responses.cache_policy = CachePolicy::Explicit;
+        let request = json!({
+            "model": "deepseek-v4-flash",
+            "prompt_cache_key": "request-key",
+            "input": [{"type": "message", "role": "user", "content": "hi"}]
+        });
+        let transformed =
+            transform_to_responses_api(&request, &responses, Some("grok-session-42")).expect("transform");
+        assert_eq!(transformed["prompt_cache_key"], "request-key");
+    }
+
+    #[test]
+    fn responses_transform_drops_prompt_cache_key_when_implicit() {
+        let mut responses = config();
+        responses.wire_format = WireFormat::Responses;
+        assert_eq!(responses.cache_policy, CachePolicy::Implicit, "implicit is the default");
+        let request = json!({
+            "model": "deepseek-v4-flash",
+            "prompt_cache_key": "request-key",
+            "input": [{"type": "message", "role": "user", "content": "hi"}]
+        });
+        let transformed =
+            transform_to_responses_api(&request, &responses, Some("grok-session-42")).expect("transform");
+        assert!(transformed.get("prompt_cache_key").is_none());
+    }
+
+    #[test]
+    fn chat_transform_forwards_max_output_tokens_to_max_tokens() {
+        let request = json!({
+            "model": "deepseek-v4-flash",
+            "max_output_tokens": 2048,
+            "input": [{"type": "message", "role": "user", "content": "hi"}]
+        });
+        let chat = transform_to_chat_completions(&request, &config()).expect("transform");
+        assert_eq!(chat["max_tokens"], 2048);
+        assert!(chat.get("max_completion_tokens").is_none());
+    }
+
+    #[test]
+    fn chat_transform_forwards_max_output_tokens_to_max_completion_tokens() {
+        let mut responses = config();
+        responses.compat.max_tokens_field = MaxTokensField::MaxCompletionTokens;
+        let request = json!({
+            "model": "deepseek-v4-flash",
+            "max_output_tokens": 2048,
+            "input": [{"type": "message", "role": "user", "content": "hi"}]
+        });
+        let chat = transform_to_chat_completions(&request, &responses).expect("transform");
+        assert_eq!(chat["max_completion_tokens"], 2048);
+        assert!(chat.get("max_tokens").is_none());
+    }
+
+    #[test]
+    fn thinking_flag_ignored_when_reasoning_effort_unsupported() {
+        let mut responses = config();
+        responses.wire_format = WireFormat::Responses;
+        responses.thinking = Some(true);
+        responses.compat.supports_reasoning_effort = false;
+        let request = json!({
+            "model": "deepseek-v4-flash",
+            "input": [{"type": "message", "role": "user", "content": "hi"}]
+        });
+        let transformed = transform_to_responses_api(&request, &responses, None).expect("transform");
+        assert!(
+            transformed.get("reasoning").and_then(Value::as_object).is_none(),
+            "no reasoning effort may be injected for providers without effort support"
+        );
+    }
+
+    #[test]
+    fn stable_request_prefix_fingerprint_is_deterministic_and_order_insensitive() {
+        let request = json!({
+            "instructions": "You are a coding agent.",
+            "tools": [
+                {"type": "function", "name": "read_file", "description": "read", "parameters": {"type": "object"}},
+                {"type": "function", "name": "run_shell", "description": "run", "parameters": {"type": "object"}}
+            ]
+        });
+        let first = crate::stable_request_prefix_fingerprint(&request);
+        assert_eq!(first, crate::stable_request_prefix_fingerprint(&request), "deterministic");
+
+        let reordered = json!({
+            "instructions": "You are a coding agent.",
+            "tools": [
+                {"type": "function", "name": "run_shell", "description": "run", "parameters": {"type": "object"}},
+                {"type": "function", "name": "read_file", "description": "read", "parameters": {"type": "object"}}
+            ]
+        });
+        assert_eq!(
+            first,
+            crate::stable_request_prefix_fingerprint(&reordered),
+            "tool order must not matter"
+        );
+    }
+
+    #[test]
+    fn stable_request_prefix_fingerprint_changes_with_content() {
+        let base = json!({
+            "instructions": "You are a coding agent.",
+            "tools": [{"type": "function", "name": "read_file", "description": "read"}]
+        });
+        let changed_instructions = json!({
+            "instructions": "You are a different agent.",
+            "tools": [{"type": "function", "name": "read_file", "description": "read"}]
+        });
+        assert_ne!(
+            crate::stable_request_prefix_fingerprint(&base),
+            crate::stable_request_prefix_fingerprint(&changed_instructions)
+        );
+        let changed_tool = json!({
+            "instructions": "You are a coding agent.",
+            "tools": [{"type": "function", "name": "read_file", "description": "changed"}]
+        });
+        assert_ne!(
+            crate::stable_request_prefix_fingerprint(&base),
+            crate::stable_request_prefix_fingerprint(&changed_tool)
+        );
+    }
+
+    #[test]
+    fn estimate_cost_usd_bills_cached_tokens_at_cache_read_rate() {
+        let cost = Cost {
+            input: 0.27,
+            output: 1.10,
+            cache_read: 0.07,
+            cache_write: 0.27,
+        };
+        let usage = StreamUsage {
+            input_tokens: 1_000,
+            cached_tokens: 0,
+            output_tokens: 500,
+            reasoning_tokens: 0,
+        };
+        let estimated = estimate_cost_usd(cost, Some(1_000), Some(700), Some(usage));
+        // (1000-700)*0.27 + 700*0.07 + 500*1.10, per 1M tokens.
+        let expected = (300.0 * 0.27 + 700.0 * 0.07 + 500.0 * 1.10) / 1_000_000.0;
+        assert!((estimated - expected).abs() < 1e-12);
     }
 }

@@ -188,7 +188,8 @@ async fn health_reports_whether_websocket_proxying_is_active() {
             "status": "ok",
             "backend": "codex",
             "websocket_proxy": true,
-            "system_prompt_policy_fingerprint": system_prompt_policy_fingerprint("")
+            "system_prompt_policy_fingerprint": system_prompt_policy_fingerprint(""),
+            "providers": []
         })
     );
 }

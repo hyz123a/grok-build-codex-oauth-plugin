@@ -35,10 +35,18 @@ Two upstream backends are supported, selected by whether an OpenAI-compatible co
 
 - `codex` (default): OAuth + ChatGPT/Codex Responses API, WebSocket incremental, explicit
   `prompt_cache_key`, web search via the OAuth backend.
-- `openai`: any OpenAI Chat `/chat/completions` provider via `base_url` + `api_key` (TOML or
-  `.env`). Implicit server-side prefix caching (no `prompt_cache_key`), web search dropped.
+- `openai`: any OpenAI-compatible provider via `base_url` + `api_key` (TOML or `.env`), in one of
+  two wire formats (`wire_format = "chat-completions" | "responses"`; `responses_api = true` is
+  the deprecated alias). Chat mode (default) talks to `{base_url}/chat/completions`: the Grok
+  Responses body is translated to Chat messages and the SSE stream bridged back; implicit
+  server-side prefix caching (no `prompt_cache_key`), web search dropped. Responses mode
+  (e.g. DeepSeek) forwards the body nearly as-is to `{base_url}/responses`: `x_search` maps to
+  the provider's `web_search` tool (server-side search) and the Codex backend's SSE bridge is
+  reused. Per-provider compat flags (`stateless`, `supports_reasoning_effort`,
+  `max_tokens_field`), a cache policy (`implicit` | `explicit` `prompt_cache_key`) and a USD
+  cost table tune DeepSeek-specific assumptions; see `docs/plan-openai-compat-hardening.md`.
 
 `codex-proxy/src/config.rs` owns backend parsing; `codex-proxy/src/backend/openai.rs` owns the
-OpenAI request transform and the SSE bridge (reusing `CodexSseTransformer` for the terminal
-`output` shape). Shared shell (auth, limits, diagnostics, cache accounting, SSE framing) stays in
-`codex-proxy/src/lib.rs`. See `docs/plan-openai-backend.md`.
+OpenAI request transforms (Chat and Responses) and the SSE bridge (reusing `CodexSseTransformer`
+for the terminal `output` shape). Shared shell (auth, limits, diagnostics, cache accounting, SSE
+framing) stays in `codex-proxy/src/lib.rs`. See `docs/plan-openai-backend.md`.

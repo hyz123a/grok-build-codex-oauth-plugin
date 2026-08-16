@@ -328,7 +328,7 @@ pub(crate) async fn handle_codex(
         first
     };
 
-    stream_response(upstream, diagnostics).await
+    stream_response(upstream, diagnostics, None).await
 }
 
 fn resolve_upstream_request_ids(

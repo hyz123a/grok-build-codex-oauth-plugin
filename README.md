@@ -131,7 +131,9 @@ represent it.
 
 Besides the default Codex OAuth backend, the proxy can drive any OpenAI-compatible upstream by
 adding a `[backend.openai]` section to `~/.grok/codex-oauth/proxy.toml` (or a `backend.env`). See
-`docs/plan-openai-backend.md` for the full multi-provider configuration.
+`docs/plan-openai-backend.md` for the full multi-provider configuration, and
+`docs/openai-provider-matrix.md` for the per-capability matrix (web search, reasoning, caching,
+tool calls, cost).
 
 Most providers (DeepSeek Chat, Groq, Together, opencode zen, ...) speak Chat
 `/chat/completions`; in that mode web search is disabled and Grok's `x_search` tool is dropped.

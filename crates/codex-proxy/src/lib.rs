@@ -35,8 +35,8 @@ use tokio::{
 use url::Url;
 
 pub use crate::config::{
-    BackendKind, ConfigError, OpenAIBackendConfig, OpenAIBackends, openai_backend_from_env_file,
-    openai_backend_from_toml,
+    BackendKind, CachePolicy, CompatFlags, ConfigError, Cost, MaxTokensField, OpenAIBackendConfig,
+    OpenAIBackends, WireFormat, openai_backend_from_env_file, openai_backend_from_toml,
 };
 
 pub const CODEX_RESPONSES_URL: &str = "https://chatgpt.com/backend-api/codex/responses";
@@ -57,6 +57,62 @@ pub fn system_prompt_policy_fingerprint(additional_instructions: &str) -> String
         .iter()
         .map(|byte| format!("{byte:02x}"))
         .collect()
+}
+
+/// Fingerprint of the parts of a Grok Responses request that must stay stable
+/// across turns for implicit server-side prefix caching to hit: the system
+/// instructions plus the full tool set, canonicalized and order-insensitive.
+/// Logged by the OpenAI backend (the reasonix "tool schema contract"
+/// analogue) so cross-turn drift is visible in the proxy logs.
+pub(crate) fn stable_request_prefix_fingerprint(request: &Value) -> String {
+    let object = request.as_object();
+    let instructions = object
+        .and_then(|object| object.get("instructions"))
+        .and_then(Value::as_str)
+        .or_else(|| {
+            object
+                .and_then(|object| object.get("messages"))
+                .and_then(Value::as_array)
+                .and_then(|messages| {
+                    messages
+                        .iter()
+                        .find(|message| {
+                            message.get("role").and_then(Value::as_str) == Some("system")
+                        })
+                })
+                .and_then(|message| message.get("content"))
+                .and_then(Value::as_str)
+        })
+        .unwrap_or("");
+    let mut tools: Vec<Value> = object
+        .and_then(|object| object.get("tools"))
+        .and_then(Value::as_array)
+        .map(|tools| tools.iter().map(canonicalize_json).collect())
+        .unwrap_or_default();
+    tools.sort_by_key(|tool| tool.to_string());
+    let canonical = canonicalize_json(&json!({ "instructions": instructions, "tools": tools }));
+    let digest = Sha256::digest(canonical.to_string().as_bytes());
+    digest[..8]
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
+}
+
+/// Recursively sort JSON object keys so semantically equal values serialize
+/// identically regardless of insertion order.
+fn canonicalize_json(value: &Value) -> Value {
+    match value {
+        Value::Object(map) => {
+            let mut entries = map
+                .iter()
+                .map(|(key, value)| (key.clone(), canonicalize_json(value)))
+                .collect::<Vec<_>>();
+            entries.sort_by(|left, right| left.0.cmp(&right.0));
+            Value::Object(entries.into_iter().collect())
+        }
+        Value::Array(items) => Value::Array(items.iter().map(canonicalize_json).collect()),
+        other => other.clone(),
+    }
 }
 
 pub fn websocket_proxy_configured_from_env() -> Result<bool, ProxyError> {
@@ -260,6 +316,35 @@ impl ProxyConfig {
         self
     }
 
+    /// OpenAI-compatible provider summary for `/health`.
+    fn openai_providers_info(&self) -> Vec<Value> {
+        self.openai_backend
+            .iter()
+            .chain(self.openai_named_backends.iter())
+            .map(|config| {
+                let wire_format = match config.wire_format {
+                    WireFormat::ChatCompletions => "chat-completions",
+                    WireFormat::Responses => "responses",
+                };
+                let cache_policy = match config.cache_policy {
+                    CachePolicy::Implicit => "implicit",
+                    CachePolicy::Explicit => "explicit",
+                };
+                json!({
+                    "name": config.name.clone().unwrap_or_else(|| "<default>".to_string()),
+                    "wire_format": wire_format,
+                    "cache_policy": cache_policy,
+                    "cost": config.cost.map(|cost| json!({
+                        "input": cost.input,
+                        "output": cost.output,
+                        "cache_read": cost.cache_read,
+                        "cache_write": cost.cache_write,
+                    })).unwrap_or(Value::Null),
+                })
+            })
+            .collect()
+    }
+
     pub fn with_limits(mut self, body_limit: usize, max_concurrency: usize) -> Self {
         self.body_limit = body_limit;
         self.max_concurrency = max_concurrency;
@@ -329,6 +414,7 @@ impl ProxyConfig {
             TransformOptions {
                 allowed_reasoning_efforts,
                 default_reasoning_effort,
+                supports_reasoning_effort: true,
             },
         );
         self
@@ -513,7 +599,8 @@ async fn health(State(state): State<AppState>) -> Json<Value> {
         "websocket_proxy": state.config.websocket_proxy.is_some(),
         "system_prompt_policy_fingerprint": system_prompt_policy_fingerprint(
             state.config.additional_instructions.as_deref().unwrap_or_default()
-        )
+        ),
+        "providers": state.config.openai_providers_info()
     }))
 }
 
@@ -563,7 +650,11 @@ async fn proxy_responses(
             .and_then(|value| value.to_str().ok())
             .map(str::to_owned)
             .unwrap_or_else(|| format!("proxy-{}-{}", std::process::id(), REQUEST_SEQUENCE.fetch_add(1, Ordering::Relaxed)));
-        return backend::openai::handle_openai(&state, &headers, &parsed, &client_request_id).await;
+        let session_id = headers
+            .get("x-grok-session-id")
+            .and_then(|value| value.to_str().ok())
+            .filter(|session| !session.is_empty());
+        return backend::openai::handle_openai(&state, &headers, &parsed, &client_request_id, session_id).await;
     }
 
     backend::codex::handle_codex(&state, &headers, parsed, request_started_at).await
@@ -589,7 +680,11 @@ fn constant_time_equal(left: &[u8], right: &[u8]) -> bool {
         == 0
 }
 
-async fn stream_response(upstream: reqwest::Response, diagnostics: RequestDiagnostics) -> Response {
+async fn stream_response(
+    upstream: reqwest::Response,
+    diagnostics: RequestDiagnostics,
+    cost: Option<Cost>,
+) -> Response {
     let status = upstream.status();
     let source_headers = upstream.headers().clone();
     if !status.is_success() {
@@ -616,7 +711,7 @@ async fn stream_response(upstream: reqwest::Response, diagnostics: RequestDiagno
         return response;
     }
     let upstream_request_id = header_value(&source_headers, "x-request-id");
-    let stream = bridge_sse_stream(upstream, diagnostics, upstream_request_id);
+    let stream = bridge_sse_stream(upstream, diagnostics, upstream_request_id, cost);
     let mut response = Response::new(Body::from_stream(stream));
     *response.status_mut() = status;
     copy_response_headers(&source_headers, &mut response);
@@ -653,13 +748,14 @@ fn bridge_sse_stream(
     upstream: reqwest::Response,
     diagnostics: RequestDiagnostics,
     upstream_request_id: String,
+    cost: Option<Cost>,
 ) -> impl futures_util::Stream<Item = Result<Bytes, std::io::Error>> {
     let source = upstream.bytes_stream();
     async_stream::stream! {
         let mut source = std::pin::pin!(source);
         let mut transformer = CodexSseTransformer::default();
         let mut stream_diagnostics =
-            StreamDiagnostics::new(diagnostics, upstream_request_id);
+            StreamDiagnostics::new(diagnostics, upstream_request_id, cost);
         while let Some(chunk) = source.next().await {
             let chunk = match chunk {
                 Ok(chunk) => chunk,
@@ -708,6 +804,9 @@ pub(crate) struct RequestDiagnostics {
     /// Named OpenAI-compatible provider serving this request (`None` = the
     /// default provider or the Codex backend).
     provider: Option<String>,
+    /// Stable-prefix fingerprint (instructions + tools) for turn-to-turn
+    /// prefix-cache stability monitoring (OpenAI backend only).
+    stable_prefix_fingerprint: Option<String>,
 }
 
 impl RequestDiagnostics {
@@ -743,6 +842,7 @@ impl RequestDiagnostics {
                 .filter(|key| !key.is_empty())
                 .map(cache_key_fingerprint),
             provider: None,
+            stable_prefix_fingerprint: None,
         }
     }
 
@@ -768,6 +868,7 @@ impl RequestDiagnostics {
         Self {
             prompt_cache_key_fingerprint: None,
             provider: provider.map(str::to_owned),
+            stable_prefix_fingerprint: Some(stable_request_prefix_fingerprint(request)),
             ..codex
         }
     }
@@ -782,6 +883,10 @@ impl RequestDiagnostics {
             prompt_cache_key_present = self.prompt_cache_key_fingerprint.is_some(),
             prompt_cache_key_fingerprint = self
                 .prompt_cache_key_fingerprint
+                .as_deref()
+                .unwrap_or("<none>"),
+            stable_prefix_fingerprint = self
+                .stable_prefix_fingerprint
                 .as_deref()
                 .unwrap_or("<none>"),
             "Codex proxy request received"
@@ -829,6 +934,10 @@ impl RequestDiagnostics {
         } else {
             cached_input_tokens as f64 * 100.0 / input_tokens as f64
         };
+        let estimated_cost_usd = metrics
+            .estimated_cost_usd
+            .map(|cost| format!("{cost:.6}"))
+            .unwrap_or_else(|| "<none>".to_string());
         tracing::info!(
             client_request_id = self.client_request_id.as_str(),
             upstream_request_id,
@@ -844,6 +953,8 @@ impl RequestDiagnostics {
             input_tokens,
             cached_input_tokens,
             cache_hit_ratio_pct,
+            usage_estimated = metrics.usage_estimated,
+            estimated_cost_usd = estimated_cost_usd.as_str(),
             "Codex proxy request completed"
         );
     }
@@ -856,6 +967,11 @@ pub(crate) struct CompletionMetrics {
     filtered_keepalive_events: u64,
     input_tokens: Option<u64>,
     cached_input_tokens: Option<u64>,
+    /// The upstream stream ended without reporting usage; token counts are
+    /// unreliable (reported as 0).
+    usage_estimated: bool,
+    /// Estimated USD cost for the request, when the provider has a cost table.
+    estimated_cost_usd: Option<f64>,
 }
 
 fn identifier_fingerprint(key: &str) -> String {
@@ -879,11 +995,13 @@ struct StreamDiagnostics {
     filtered_keepalive_events: u64,
     input_tokens: Option<u64>,
     cached_input_tokens: Option<u64>,
+    output_tokens: Option<u64>,
+    cost: Option<Cost>,
     finished: bool,
 }
 
 impl StreamDiagnostics {
-    fn new(request: RequestDiagnostics, upstream_request_id: String) -> Self {
+    fn new(request: RequestDiagnostics, upstream_request_id: String, cost: Option<Cost>) -> Self {
         Self {
             request,
             upstream_request_id,
@@ -894,6 +1012,8 @@ impl StreamDiagnostics {
             filtered_keepalive_events: 0,
             input_tokens: None,
             cached_input_tokens: None,
+            output_tokens: None,
+            cost,
             finished: false,
         }
     }
@@ -919,6 +1039,9 @@ impl StreamDiagnostics {
         if let Some((input_tokens, cached_input_tokens)) = extract_cache_usage(event) {
             self.input_tokens = Some(input_tokens);
             self.cached_input_tokens = Some(cached_input_tokens);
+        }
+        if let Some(output_tokens) = extract_output_tokens(event) {
+            self.output_tokens = Some(output_tokens);
         }
         let Some(error_type) = extract_sse_error_type(event) else {
             return;
@@ -962,12 +1085,21 @@ impl StreamDiagnostics {
     }
 
     fn completion_metrics(&self) -> CompletionMetrics {
+        let estimated_cost_usd = self.cost.map(|cost| {
+            let input = self.input_tokens.unwrap_or(0) as f64;
+            let cached = self.cached_input_tokens.unwrap_or(0) as f64;
+            let output = self.output_tokens.unwrap_or(0) as f64;
+            ((input - cached).max(0.0) * cost.input + cached * cost.cache_read + output * cost.output)
+                / 1_000_000.0
+        });
         CompletionMetrics {
             bytes_received: self.bytes_received,
             chunks_received: self.chunks_received,
             filtered_keepalive_events: self.filtered_keepalive_events,
             input_tokens: self.input_tokens,
             cached_input_tokens: self.cached_input_tokens,
+            usage_estimated: false,
+            estimated_cost_usd,
         }
     }
 }
@@ -1001,6 +1133,10 @@ pub(crate) fn extract_cache_usage(event: &[u8]) -> Option<(u64, u64)> {
     .iter()
     .find_map(|pointer| value.pointer(pointer).and_then(Value::as_u64))?;
     let cached_input_tokens = [
+        // DeepSeek's native cache accounting (`prompt_cache_hit_tokens`) comes
+        // first; OpenAI-style `cached_tokens` is the fallback.
+        "/response/usage/prompt_cache_hit_tokens",
+        "/usage/prompt_cache_hit_tokens",
         "/response/usage/input_tokens_details/cached_tokens",
         "/usage/input_tokens_details/cached_tokens",
         "/usage/prompt_tokens_details/cached_tokens",
@@ -1009,6 +1145,25 @@ pub(crate) fn extract_cache_usage(event: &[u8]) -> Option<(u64, u64)> {
     .find_map(|pointer| value.pointer(pointer).and_then(Value::as_u64))
     .unwrap_or(0);
     Some((input_tokens, cached_input_tokens))
+}
+
+/// Output tokens from a Responses-format SSE usage block (used for cost
+/// estimation).
+pub(crate) fn extract_output_tokens(event: &[u8]) -> Option<u64> {
+    let text = std::str::from_utf8(event).ok()?;
+    let data = text.lines().find_map(|line| {
+        line.strip_prefix("data:")
+            .map(str::trim_start)
+            .filter(|data| !data.is_empty() && *data != "[DONE]")
+    })?;
+    let value = serde_json::from_str::<Value>(data).ok()?;
+    [
+        "/response/usage/output_tokens",
+        "/usage/output_tokens",
+        "/usage/completion_tokens",
+    ]
+    .iter()
+    .find_map(|pointer| value.pointer(pointer).and_then(Value::as_u64))
 }
 
 pub(crate) fn extract_sse_error_type(event: &[u8]) -> Option<String> {
@@ -1335,5 +1490,21 @@ mod tests {
             ),
             StatusCode::NOT_FOUND
         );
+    }
+
+    #[test]
+    fn extract_cache_usage_reads_deepseek_native_hit_tokens_first() {
+        use super::{extract_cache_usage, extract_output_tokens};
+        let deepseek_chat = b"data: {\"usage\":{\"prompt_tokens\":100,\"completion_tokens\":20,\"prompt_cache_hit_tokens\":80,\"prompt_cache_miss_tokens\":20}}\n\n";
+        assert_eq!(extract_cache_usage(deepseek_chat), Some((100, 80)));
+        assert_eq!(extract_output_tokens(deepseek_chat), Some(20));
+
+        // OpenAI-style `cached_tokens` remains the fallback.
+        let openai_style = b"data: {\"usage\":{\"prompt_tokens\":100,\"prompt_tokens_details\":{\"cached_tokens\":75}}}\n\n";
+        assert_eq!(extract_cache_usage(openai_style), Some((100, 75)));
+
+        // Responses-format path.
+        let responses = b"data: {\"response\":{\"usage\":{\"input_tokens\":100,\"input_tokens_details\":{\"cached_tokens\":90}}}}\n\n";
+        assert_eq!(extract_cache_usage(responses), Some((100, 90)));
     }
 }

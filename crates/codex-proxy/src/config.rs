@@ -4,10 +4,11 @@
 //!
 //! - `codex` (default): OAuth-backed ChatGPT/Codex Responses API with WebSocket
 //!   incremental transport and an explicit `prompt_cache_key`.
-//! - `openai`: any OpenAI Chat `/chat/completions` compatible provider
-//!   (DeepSeek, Groq, Together, a local gateway, ...) configured by `base_url`
-//!   and `api_key`. Caching is implicit server-side prefix caching; no explicit
-//!   key is emitted.
+//! - `openai`: any OpenAI-compatible provider configured by `base_url` and
+//!   `api_key`, speaking either Chat `/chat/completions` (translated) or the
+//!   Responses API `/responses` (near-passthrough). Caching defaults to
+//!   implicit server-side prefix caching; `cache_policy = "explicit"` opts into
+//!   an explicit `prompt_cache_key` (Responses mode only).
 
 use std::collections::HashMap;
 
@@ -46,16 +47,94 @@ pub struct OpenAIBackendConfig {
     pub reasoning_efforts: Vec<String>,
     /// Default reasoning effort among `reasoning_efforts`.
     pub default_reasoning_effort: Option<String>,
-    /// Speak the provider's Responses API (`{base_url}/responses`) and forward
-    /// the Grok Responses body directly instead of translating it to Chat
-    /// Completions. Enables provider-specific capabilities such as DeepSeek's
-    /// server-side `web_search` tool.
-    pub responses_api: bool,
+    /// Which wire format this provider speaks: OpenAI Chat `/chat/completions`
+    /// (the Grok Responses body is translated) or the Responses API
+    /// `{base_url}/responses` (near-passthrough, enables provider-specific
+    /// capabilities such as DeepSeek's server-side `web_search` tool).
+    pub wire_format: WireFormat,
+    /// Provider compatibility flags (see `CompatFlags`). Defaults preserve
+    /// DeepSeek semantics.
+    pub compat: CompatFlags,
+    /// Cache strategy: implicit server-side prefix caching (default) or an
+    /// explicit `prompt_cache_key` (Responses mode only).
+    pub cache_policy: CachePolicy,
+    /// Per-provider pricing in USD per 1M tokens; `None` omits cost estimates
+    /// from diagnostics.
+    pub cost: Option<Cost>,
     /// Keep Grok's `x_search` tool mapped to the provider's `web_search` tool
-    /// (Responses mode only). Defaults to `responses_api` when unset; set
+    /// (Responses mode only). Defaults to Responses mode when unset; set
     /// `false` to keep dropping search tools.
     pub web_search: bool,
     pub extra_headers: HashMap<String, String>,
+}
+
+/// Which OpenAI-compatible wire format a provider speaks.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum WireFormat {
+    /// OpenAI Chat `/chat/completions`, translated from the Grok Responses
+    /// body.
+    #[default]
+    ChatCompletions,
+    /// OpenAI Responses API `{base_url}/responses`, near-passthrough.
+    Responses,
+}
+
+/// Cache strategy for an OpenAI-compatible provider.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum CachePolicy {
+    /// Rely on the provider's implicit server-side prefix caching; never emit
+    /// an explicit `prompt_cache_key`.
+    #[default]
+    Implicit,
+    /// Emit an explicit `prompt_cache_key` (Responses mode only), taken from
+    /// the request body or derived from the `x-grok-session-id` header. For
+    /// providers whose caching requires a stable key (e.g. OpenAI/xAI
+    /// Responses).
+    Explicit,
+}
+
+/// Which field carries the output-token budget on Chat requests.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum MaxTokensField {
+    #[default]
+    MaxTokens,
+    MaxCompletionTokens,
+}
+
+/// Provider compatibility flags. The defaults match DeepSeek's semantics, so
+/// existing configurations behave identically.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct CompatFlags {
+    /// Responses mode: strip `previous_response_id` (stateless providers).
+    /// `false` keeps it for stateful Responses APIs (e.g. OpenAI).
+    pub stateless: bool,
+    /// Advertise and send `reasoning.effort`. `false` skips effort wiring for
+    /// providers without a reasoning-effort parameter.
+    pub supports_reasoning_effort: bool,
+    /// Chat mode field for the output-token budget (`max_tokens` or
+    /// `max_completion_tokens`).
+    pub max_tokens_field: MaxTokensField,
+}
+
+impl Default for CompatFlags {
+    fn default() -> Self {
+        Self {
+            stateless: true,
+            supports_reasoning_effort: true,
+            max_tokens_field: MaxTokensField::MaxTokens,
+        }
+    }
+}
+
+/// Per-provider pricing in USD per 1M tokens (fields align with pi's `cost`).
+/// `cache_write` is reserved for providers that bill cache writes separately;
+/// the proxy does not track write tokens yet.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Cost {
+    pub input: f64,
+    pub output: f64,
+    pub cache_read: f64,
+    pub cache_write: f64,
 }
 
 /// The full set of configured OpenAI-compatible backends: an optional default
@@ -100,6 +179,12 @@ pub enum ConfigError {
     MissingProviderApiKey { name: String },
     #[error("openai backend requires a non-empty `base_url`")]
     MissingBaseUrl,
+    #[error("invalid `{field}` value `{value}` (expected one of: {expected})")]
+    InvalidEnumValue {
+        field: String,
+        value: String,
+        expected: String,
+    },
 }
 
 /// Shared field set for an OpenAI-compatible provider (`[backend.openai]` or
@@ -120,10 +205,39 @@ struct RawProviderFields {
     /// Model-name routing prefix for a named provider. Omitted on the default
     /// provider; when omitted on a named provider it defaults to `"{name}/"`.
     model_prefix: Option<String>,
+    /// Wire format (`"chat-completions"` / `"responses"`). Deprecated alias:
+    /// `responses_api = true` implies `"responses"`.
+    wire_format: Option<String>,
     /// Responses API mode (see `OpenAIBackendConfig`). `None` = unset.
     responses_api: Option<bool>,
-    /// Web search enablement in Responses mode. `None` = follow `responses_api`.
+    /// Web search enablement in Responses mode. `None` = follow wire format.
     web_search: Option<bool>,
+    /// Compatibility flags (`compat.stateless`, ...). `None` = defaults.
+    compat: Option<RawCompatFields>,
+    /// Cache strategy (`"implicit"` / `"explicit"`). `None` = implicit.
+    cache_policy: Option<String>,
+    /// Per-provider pricing. `None` = no cost estimates.
+    cost: Option<RawCostFields>,
+}
+
+/// Deserialized shape of a `[backend.openai.compat]` table (or the flat
+/// `.env` `OPENAI_COMPAT_*` keys). Missing fields fall back to
+/// `CompatFlags::default()`.
+#[derive(Clone, Debug, Default, Deserialize)]
+struct RawCompatFields {
+    stateless: Option<bool>,
+    supports_reasoning_effort: Option<bool>,
+    max_tokens_field: Option<String>,
+}
+
+/// Deserialized shape of a `[backend.openai.cost]` table (or the flat `.env`
+/// `OPENAI_COST_*` keys). Missing prices default to `0.0`.
+#[derive(Clone, Debug, Default, Deserialize)]
+struct RawCostFields {
+    input: Option<f64>,
+    output: Option<f64>,
+    cache_read: Option<f64>,
+    cache_write: Option<f64>,
 }
 
 /// Deserialized shape of the `[backend.openai]` TOML section (or .env file).
@@ -144,10 +258,19 @@ struct RawOpenAIConfig {
     extra_headers: HashMap<String, String>,
     #[serde(default)]
     providers: HashMap<String, RawProviderFields>,
+    /// Wire format (`"chat-completions"` / `"responses"`). Deprecated alias:
+    /// `responses_api = true` implies `"responses"`.
+    wire_format: Option<String>,
     /// Responses API mode (see `OpenAIBackendConfig`). `None` = unset.
     responses_api: Option<bool>,
-    /// Web search enablement in Responses mode. `None` = follow `responses_api`.
+    /// Web search enablement in Responses mode. `None` = follow wire format.
     web_search: Option<bool>,
+    /// Compatibility flags. `None` = defaults.
+    compat: Option<RawCompatFields>,
+    /// Cache strategy (`"implicit"` / `"explicit"`). `None` = implicit.
+    cache_policy: Option<String>,
+    /// Per-provider pricing. `None` = no cost estimates.
+    cost: Option<RawCostFields>,
 }
 
 impl RawOpenAIConfig {
@@ -163,8 +286,12 @@ impl RawOpenAIConfig {
             default_reasoning_effort: self.default_reasoning_effort.clone(),
             extra_headers: self.extra_headers.clone(),
             model_prefix: None,
+            wire_format: self.wire_format.clone(),
             responses_api: self.responses_api,
             web_search: self.web_search,
+            compat: self.compat.clone(),
+            cache_policy: self.cache_policy.clone(),
+            cost: self.cost.clone(),
         }
     }
 }
@@ -218,8 +345,12 @@ pub fn openai_backend_from_env_file(
     let mut api_key = None;
     let mut model = None;
     let mut extra_headers = HashMap::new();
+    let mut wire_format = None;
     let mut responses_api = None;
     let mut web_search = None;
+    let mut compat = RawCompatFields::default();
+    let mut cache_policy = None;
+    let mut cost = RawCostFields::default();
     for line in contents.lines() {
         let line = line.trim();
         if line.is_empty() || line.starts_with('#') {
@@ -234,8 +365,30 @@ pub fn openai_backend_from_env_file(
             "OPENAI_BASE_URL" => base_url = Some(value.to_owned()),
             "OPENAI_API_KEY" => api_key = Some(value.to_owned()),
             "OPENAI_MODEL" => model = Some(value.to_owned()),
+            // Enum-style keys validate eagerly so a typo cannot silently switch
+            // the upstream protocol.
+            "OPENAI_WIRE_FORMAT" => {
+                parse_wire_format(&value)?;
+                wire_format = Some(value.to_owned());
+            }
             "OPENAI_RESPONSES_API" => responses_api = parse_env_bool(&value),
             "OPENAI_WEB_SEARCH" => web_search = parse_env_bool(&value),
+            "OPENAI_COMPAT_STATELESS" => compat.stateless = parse_env_bool(&value),
+            "OPENAI_COMPAT_SUPPORTS_REASONING_EFFORT" => {
+                compat.supports_reasoning_effort = parse_env_bool(&value);
+            }
+            "OPENAI_COMPAT_MAX_TOKENS_FIELD" => {
+                parse_max_tokens_field(&value)?;
+                compat.max_tokens_field = Some(value.to_owned());
+            }
+            "OPENAI_CACHE_POLICY" => {
+                parse_cache_policy(&value)?;
+                cache_policy = Some(value.to_owned());
+            }
+            "OPENAI_COST_INPUT" => cost.input = value.parse().ok(),
+            "OPENAI_COST_OUTPUT" => cost.output = value.parse().ok(),
+            "OPENAI_COST_CACHE_READ" => cost.cache_read = value.parse().ok(),
+            "OPENAI_COST_CACHE_WRITE" => cost.cache_write = value.parse().ok(),
             _ if key.starts_with("OPENAI_HEADER_") => {
                 let name = key
                     .trim_start_matches("OPENAI_HEADER_")
@@ -249,6 +402,15 @@ pub fn openai_backend_from_env_file(
     if base_url.is_none() && api_key.is_none() && model.is_none() && extra_headers.is_empty() {
         return Ok(None);
     }
+    let compat_fields = (compat.stateless.is_some()
+        || compat.supports_reasoning_effort.is_some()
+        || compat.max_tokens_field.is_some())
+    .then_some(compat);
+    let cost_fields = (cost.input.is_some()
+        || cost.output.is_some()
+        || cost.cache_read.is_some()
+        || cost.cache_write.is_some())
+    .then_some(cost);
     let fields = RawProviderFields {
         base_url,
         api_key,
@@ -259,8 +421,12 @@ pub fn openai_backend_from_env_file(
         default_reasoning_effort: None,
         extra_headers,
         model_prefix: None,
+        wire_format,
         responses_api,
         web_search,
+        compat: compat_fields,
+        cache_policy,
+        cost: cost_fields,
     };
     let default = resolve_provider(fields, None, None, &system_env)?;
     Ok(Some(OpenAIBackends { default, named: Vec::new() }))
@@ -345,6 +511,24 @@ fn resolve_provider(
             Some(name) => ConfigError::MissingProviderApiKey { name: name.clone() },
             None => ConfigError::MissingApiKey,
         })?;
+    let wire_format = match raw.wire_format {
+        Some(value) => parse_wire_format(&value)?,
+        None => {
+            if raw.responses_api.unwrap_or(false) {
+                WireFormat::Responses
+            } else {
+                WireFormat::ChatCompletions
+            }
+        }
+    };
+    let compat = match raw.compat {
+        Some(fields) => resolve_compat(fields)?,
+        None => CompatFlags::default(),
+    };
+    let cache_policy = match raw.cache_policy {
+        Some(value) => parse_cache_policy(&value)?,
+        None => CachePolicy::Implicit,
+    };
     Ok(Some(OpenAIBackendConfig {
         name,
         model_prefix,
@@ -355,13 +539,72 @@ fn resolve_provider(
         thinking: raw.thinking,
         reasoning_efforts: raw.reasoning_efforts,
         default_reasoning_effort: raw.default_reasoning_effort,
-        responses_api: raw.responses_api.unwrap_or(false),
-        // Web search defaults to the Responses-mode switch so enabling the
-        // Responses API also enables DeepSeek's server-side web search, unless
-        // explicitly disabled.
-        web_search: raw.web_search.unwrap_or(raw.responses_api.unwrap_or(false)),
+        wire_format,
+        compat,
+        cache_policy,
+        cost: raw.cost.map(resolve_cost),
+        // Web search defaults to the Responses wire format so enabling it also
+        // enables DeepSeek's server-side web search, unless explicitly disabled.
+        web_search: raw.web_search.unwrap_or(wire_format == WireFormat::Responses),
         extra_headers: raw.extra_headers,
     }))
+}
+
+fn parse_wire_format(value: &str) -> Result<WireFormat, ConfigError> {
+    match value.trim() {
+        "chat-completions" => Ok(WireFormat::ChatCompletions),
+        "responses" => Ok(WireFormat::Responses),
+        other => Err(ConfigError::InvalidEnumValue {
+            field: "wire_format".into(),
+            value: other.into(),
+            expected: "`chat-completions` or `responses`".into(),
+        }),
+    }
+}
+
+fn parse_cache_policy(value: &str) -> Result<CachePolicy, ConfigError> {
+    match value.trim() {
+        "implicit" => Ok(CachePolicy::Implicit),
+        "explicit" => Ok(CachePolicy::Explicit),
+        other => Err(ConfigError::InvalidEnumValue {
+            field: "cache_policy".into(),
+            value: other.into(),
+            expected: "`implicit` or `explicit`".into(),
+        }),
+    }
+}
+
+fn parse_max_tokens_field(value: &str) -> Result<MaxTokensField, ConfigError> {
+    match value.trim() {
+        "max_tokens" => Ok(MaxTokensField::MaxTokens),
+        "max_completion_tokens" => Ok(MaxTokensField::MaxCompletionTokens),
+        other => Err(ConfigError::InvalidEnumValue {
+            field: "compat.max_tokens_field".into(),
+            value: other.into(),
+            expected: "`max_tokens` or `max_completion_tokens`".into(),
+        }),
+    }
+}
+
+fn resolve_compat(raw: RawCompatFields) -> Result<CompatFlags, ConfigError> {
+    let max_tokens_field = match raw.max_tokens_field {
+        Some(value) => parse_max_tokens_field(&value)?,
+        None => MaxTokensField::default(),
+    };
+    Ok(CompatFlags {
+        stateless: raw.stateless.unwrap_or(true),
+        supports_reasoning_effort: raw.supports_reasoning_effort.unwrap_or(true),
+        max_tokens_field,
+    })
+}
+
+fn resolve_cost(raw: RawCostFields) -> Cost {
+    Cost {
+        input: raw.input.unwrap_or(0.0),
+        output: raw.output.unwrap_or(0.0),
+        cache_read: raw.cache_read.unwrap_or(0.0),
+        cache_write: raw.cache_write.unwrap_or(0.0),
+    }
 }
 
 /// Read an environment variable (default env source; injectable in tests).
@@ -427,8 +670,12 @@ mod tests {
             default_reasoning_effort: None,
             extra_headers: HashMap::new(),
             providers: HashMap::new(),
+            wire_format: None,
             responses_api: None,
             web_search: None,
+            compat: None,
+            cache_policy: None,
+            cost: None,
         };
         // No base_url anywhere -> empty (not an error), the section may host
         // only named providers.
@@ -445,8 +692,12 @@ mod tests {
             default_reasoning_effort: None,
             extra_headers: HashMap::new(),
             providers: HashMap::new(),
+            wire_format: None,
             responses_api: None,
             web_search: None,
+            compat: None,
+            cache_policy: None,
+            cost: None,
         };
         assert!(matches!(
             resolve_with_env(missing_key, &no_env),
@@ -526,8 +777,8 @@ mod tests {
         .expect("write");
         let backends = openai_backend_from_toml(&path).expect("parse").expect("present");
         let config = backends.default.expect("default provider");
-        assert!(config.responses_api);
-        assert!(config.web_search, "web_search should follow responses_api by default");
+        assert_eq!(config.wire_format, WireFormat::Responses);
+        assert!(config.web_search, "web_search should follow Responses mode by default");
     }
 
     #[test]
@@ -545,7 +796,7 @@ mod tests {
         .expect("write");
         let backends = openai_backend_from_toml(&path).expect("parse").expect("present");
         let config = backends.default.expect("default provider");
-        assert!(config.responses_api);
+        assert_eq!(config.wire_format, WireFormat::Responses);
         assert!(!config.web_search, "explicit web_search = false must be honored");
     }
 
@@ -565,7 +816,7 @@ mod tests {
         let backends = openai_backend_from_toml(&path).expect("parse").expect("present");
         assert!(backends.default.is_none());
         assert_eq!(backends.named.len(), 1);
-        assert!(backends.named[0].responses_api);
+        assert_eq!(backends.named[0].wire_format, WireFormat::Responses);
         assert!(backends.named[0].web_search);
     }
 
@@ -583,7 +834,7 @@ mod tests {
         .expect("write");
         let backends = openai_backend_from_env_file(&path).expect("parse").expect("present");
         let config = backends.default.expect("default provider");
-        assert!(config.responses_api);
+        assert_eq!(config.wire_format, WireFormat::Responses);
         assert!(config.web_search);
     }
 
@@ -658,6 +909,220 @@ mod tests {
         assert!(matches!(
             error,
             ConfigError::MissingProviderApiKey { name } if name == "zen"
+        ));
+    }
+
+    #[test]
+    fn toml_parses_wire_format_explicitly() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("proxy.toml");
+        std::fs::write(
+            &path,
+            "[backend.openai]\n\
+             base_url = \"https://api.deepseek.com\"\n\
+             api_key = \"sk-test\"\n\
+             wire_format = \"responses\"\n",
+        )
+        .expect("write");
+        let backends = openai_backend_from_toml(&path).expect("parse").expect("present");
+        let config = backends.default.expect("default provider");
+        assert_eq!(config.wire_format, WireFormat::Responses);
+        assert!(config.web_search, "web_search follows Responses wire format by default");
+    }
+
+    #[test]
+    fn toml_rejects_invalid_wire_format() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("proxy.toml");
+        std::fs::write(
+            &path,
+            "[backend.openai]\n\
+             base_url = \"https://api.deepseek.com\"\n\
+             api_key = \"sk-test\"\n\
+             wire_format = \"banana\"\n",
+        )
+        .expect("write");
+        let error = openai_backend_from_toml(&path).expect_err("invalid wire_format");
+        assert!(matches!(
+            error,
+            ConfigError::InvalidEnumValue { ref field, ref value, .. }
+                if field == "wire_format" && value == "banana"
+        ));
+    }
+
+    #[test]
+    fn responses_api_alias_still_selects_responses_mode() {
+        // Deprecated `responses_api = true` keeps working without `wire_format`.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("proxy.toml");
+        std::fs::write(
+            &path,
+            "[backend.openai]\n\
+             base_url = \"https://api.deepseek.com\"\n\
+             api_key = \"sk-test\"\n\
+             responses_api = true\n\
+             web_search = false\n",
+        )
+        .expect("write");
+        let backends = openai_backend_from_toml(&path).expect("parse").expect("present");
+        let config = backends.default.expect("default provider");
+        assert_eq!(config.wire_format, WireFormat::Responses);
+        assert!(!config.web_search);
+    }
+
+    #[test]
+    fn toml_parses_compat_flags_with_defaults() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("proxy.toml");
+        std::fs::write(
+            &path,
+            "[backend.openai]\n\
+             base_url = \"https://api.deepseek.com\"\n\
+             api_key = \"sk-test\"\n\
+             [backend.openai.compat]\n\
+             stateless = false\n\
+             supports_reasoning_effort = false\n\
+             max_tokens_field = \"max_completion_tokens\"\n",
+        )
+        .expect("write");
+        let backends = openai_backend_from_toml(&path).expect("parse").expect("present");
+        let config = backends.default.expect("default provider");
+        assert!(!config.compat.stateless);
+        assert!(!config.compat.supports_reasoning_effort);
+        assert_eq!(config.compat.max_tokens_field, MaxTokensField::MaxCompletionTokens);
+    }
+
+    #[test]
+    fn compat_defaults_preserve_deepseek_semantics() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("proxy.toml");
+        std::fs::write(
+            &path,
+            "[backend.openai]\n\
+             base_url = \"https://api.deepseek.com\"\n\
+             api_key = \"sk-test\"\n",
+        )
+        .expect("write");
+        let backends = openai_backend_from_toml(&path).expect("parse").expect("present");
+        let config = backends.default.expect("default provider");
+        assert_eq!(config.compat, CompatFlags::default());
+        assert!(config.compat.stateless);
+        assert!(config.compat.supports_reasoning_effort);
+        assert_eq!(config.compat.max_tokens_field, MaxTokensField::MaxTokens);
+    }
+
+    #[test]
+    fn toml_rejects_invalid_max_tokens_field() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("proxy.toml");
+        std::fs::write(
+            &path,
+            "[backend.openai]\n\
+             base_url = \"https://api.deepseek.com\"\n\
+             api_key = \"sk-test\"\n\
+             [backend.openai.compat]\n\
+             max_tokens_field = \"banana\"\n",
+        )
+        .expect("write");
+        let error = openai_backend_from_toml(&path).expect_err("invalid max_tokens_field");
+        assert!(matches!(
+            error,
+            ConfigError::InvalidEnumValue { ref field, .. }
+                if field == "compat.max_tokens_field"
+        ));
+    }
+
+    #[test]
+    fn toml_parses_cache_policy_and_cost() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("proxy.toml");
+        std::fs::write(
+            &path,
+            "[backend.openai]\n\
+             base_url = \"https://api.deepseek.com\"\n\
+             api_key = \"sk-test\"\n\
+             cache_policy = \"explicit\"\n\
+             [backend.openai.cost]\n\
+             input = 0.27\n\
+             output = 1.10\n\
+             cache_read = 0.07\n\
+             cache_write = 0.27\n",
+        )
+        .expect("write");
+        let backends = openai_backend_from_toml(&path).expect("parse").expect("present");
+        let config = backends.default.expect("default provider");
+        assert_eq!(config.cache_policy, CachePolicy::Explicit);
+        let cost = config.cost.expect("cost table");
+        assert_eq!(cost.input, 0.27);
+        assert_eq!(cost.output, 1.10);
+        assert_eq!(cost.cache_read, 0.07);
+        assert_eq!(cost.cache_write, 0.27);
+    }
+
+    #[test]
+    fn toml_rejects_invalid_cache_policy() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("proxy.toml");
+        std::fs::write(
+            &path,
+            "[backend.openai]\n\
+             base_url = \"https://api.deepseek.com\"\n\
+             api_key = \"sk-test\"\n\
+             cache_policy = \"banana\"\n",
+        )
+        .expect("write");
+        let error = openai_backend_from_toml(&path).expect_err("invalid cache_policy");
+        assert!(matches!(
+            error,
+            ConfigError::InvalidEnumValue { ref field, .. } if field == "cache_policy"
+        ));
+    }
+
+    #[test]
+    fn env_file_parses_wire_format_compat_cache_and_cost() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("backend.env");
+        std::fs::write(
+            &path,
+            "OPENAI_BASE_URL=https://api.deepseek.com\n\
+             OPENAI_API_KEY=sk-test\n\
+             OPENAI_WIRE_FORMAT=responses\n\
+             OPENAI_COMPAT_STATELESS=0\n\
+             OPENAI_COMPAT_SUPPORTS_REASONING_EFFORT=0\n\
+             OPENAI_COMPAT_MAX_TOKENS_FIELD=max_completion_tokens\n\
+             OPENAI_CACHE_POLICY=explicit\n\
+             OPENAI_COST_INPUT=0.27\n\
+             OPENAI_COST_OUTPUT=1.10\n\
+             OPENAI_COST_CACHE_READ=0.07\n",
+        )
+        .expect("write");
+        let backends = openai_backend_from_env_file(&path).expect("parse").expect("present");
+        let config = backends.default.expect("default provider");
+        assert_eq!(config.wire_format, WireFormat::Responses);
+        assert!(!config.compat.stateless);
+        assert!(!config.compat.supports_reasoning_effort);
+        assert_eq!(config.compat.max_tokens_field, MaxTokensField::MaxCompletionTokens);
+        assert_eq!(config.cache_policy, CachePolicy::Explicit);
+        let cost = config.cost.expect("cost");
+        assert_eq!(cost.input, 0.27);
+        assert_eq!(cost.cache_write, 0.0, "unset cost field defaults to zero");
+    }
+
+    #[test]
+    fn env_file_rejects_invalid_wire_format_eagerly() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("backend.env");
+        std::fs::write(
+            &path,
+            "OPENAI_BASE_URL=https://api.deepseek.com\n\
+             OPENAI_API_KEY=sk-test\n\
+             OPENAI_WIRE_FORMAT=banana\n",
+        )
+        .expect("write");
+        let error = openai_backend_from_env_file(&path).expect_err("invalid wire_format");
+        assert!(matches!(
+            error,
+            ConfigError::InvalidEnumValue { ref field, .. } if field == "wire_format"
         ));
     }
 }
