@@ -1125,4 +1125,27 @@ mod tests {
             ConfigError::InvalidEnumValue { ref field, .. } if field == "wire_format"
         ));
     }
+
+    #[test]
+    fn shipped_proxy_toml_example_parses() {
+        // The example shipped in plugin/assets must always stay parseable, so a
+        // schema change can never silently break the documented configuration.
+        let path = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../plugin/assets/proxy.toml.example"
+        );
+        let backends =
+            openai_backend_from_toml(std::path::Path::new(path)).expect("parse").expect("present");
+        let default = backends.default.expect("default provider");
+        assert_eq!(default.wire_format, WireFormat::Responses);
+        assert_eq!(default.cache_policy, CachePolicy::Implicit);
+        assert_eq!(default.compat, CompatFlags::default());
+        let cost = default.cost.expect("default provider cost table");
+        assert_eq!(cost.input, 1.5);
+        assert_eq!(cost.cache_read, 0.05);
+        assert_eq!(backends.named.len(), 1);
+        assert_eq!(backends.named[0].name.as_deref(), Some("opencode-zen"));
+        assert_eq!(backends.named[0].wire_format, WireFormat::ChatCompletions);
+        assert!(backends.named[0].cost.is_none(), "zen cost table stays commented out");
+    }
 }

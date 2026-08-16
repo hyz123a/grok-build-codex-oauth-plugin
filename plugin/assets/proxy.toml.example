@@ -1,0 +1,95 @@
+# Example OpenAI-compatible backend configuration.
+#
+# Copy this file into your user data directory:
+#
+#   cp plugin/assets/proxy.toml.example ~/.grok/codex-oauth/proxy.toml
+#
+# The proxy reads `~/.grok/codex-oauth/proxy.toml` at daemon start; edit it and
+# run `grok-codex-oauth restart --port 1456` (or the `status` skill) to pick up
+# changes. Remove the `[backend.openai]` section (or the file) to go back to the
+# default Codex OAuth backend.
+#
+# Two wire formats are supported per provider (`wire_format`):
+#   - "chat-completions" (default): Grok's Responses body is translated to an
+#     OpenAI Chat request at `{base_url}/chat/completions`.
+#   - "responses": the body is forwarded nearly as-is to `{base_url}/responses`
+#     (e.g. DeepSeek's native Responses API with server-side web_search).
+# The deprecated `responses_api = true` alias resolves to `wire_format =
+# "responses"` and still works.
+#
+# An equivalent flat `backend.env` file (OPENAI_BASE_URL / OPENAI_API_KEY /
+# OPENAI_MODEL / OPENAI_WIRE_FORMAT / OPENAI_CACHE_POLICY / OPENAI_COST_* /
+# OPENAI_COMPAT_* / OPENAI_HEADER_*) is read when proxy.toml is absent; it does
+# not support named providers or per-model context windows.
+
+# ---- Default provider: DeepSeek official (Responses API mode) ----
+[backend.openai]
+base_url = "https://api.deepseek.com"       # -> https://api.deepseek.com/responses
+api_key = "${DEEPSEEK_API_KEY}"             # or a literal key; falls back to OPENAI_API_KEY / DEEPSEEK_API_KEY
+model = "deepseek-v4-flash"                 # default model for un-prefixed requests
+wire_format = "responses"                   # native Responses API: server-side web_search works
+# web_search = true                         # defaults to Responses mode; set false to drop search tools
+thinking = true                             # DeepSeek thinking mode; the proxy echoes reasoning_content back
+reasoning_efforts = ["low", "high", "max"]  # advertised to Grok so it shows the thinking UI
+default_reasoning_effort = "high"
+
+# Provider compatibility flags (defaults match DeepSeek semantics; uncomment to
+# change them, e.g. for OpenAI's stateful Responses API):
+# [backend.openai.compat]
+# stateless = true                 # false = keep previous_response_id (stateful APIs)
+# supports_reasoning_effort = true # false = never send/advertise reasoning.effort
+# max_tokens_field = "max_tokens"  # Chat-mode budget field: "max_tokens" | "max_completion_tokens"
+
+# Cache strategy: implicit server-side prefix caching (default). Providers whose
+# caching needs an explicit key (OpenAI/xAI Responses) opt in with:
+# cache_policy = "explicit"        # injects prompt_cache_key (request key -> x-grok-session-id)
+
+# Per-provider pricing (USD per 1M tokens) -> `estimated_cost_usd` in the daemon
+# log. There is no official pricing API (DeepSeek prices change and have
+# peak/off-peak tiers), so this table is manual. Values below are DeepSeek's
+# official CNY off-peak rates for deepseek-v4-flash (peak is ~2x); convert to
+# your billing currency. cache_write is not billed separately by DeepSeek.
+[backend.openai.cost]
+input = 1.5
+output = 4.5
+cache_read = 0.05
+cache_write = 0
+
+# Per-model context window (tokens) advertised to Grok for synced models.
+# A model absent here falls back to Grok's default (272K). DeepSeek V4 is 1M.
+[backend.openai.model_context_windows]
+"deepseek-v4-flash" = 1048576
+"deepseek-v4-pro" = 1048576
+
+# ---- Named provider: opencode zen (DeepSeek V4 via opencode.ai/zen, Chat mode) ----
+# Model ids are prefixed with `opencode/` so they stay distinct from the DeepSeek
+# entries above (`codex-opencode-deepseek-v4-flash` vs `codex-deepseek-v4-flash`)
+# and route here automatically. Get an API key at https://opencode.ai (sk-...).
+# Note: no `wire_format` here -> "chat-completions" (translation mode); in that
+# mode web search is disabled and Grok's `x_search` tool is dropped.
+[backend.openai.providers.opencode-zen]
+base_url = "https://opencode.ai/zen/v1"     # -> https://opencode.ai/zen/v1/chat/completions
+api_key = "${OPENCODE_ZEN_API_KEY}"         # named providers must supply their own key
+model = "opencode/deepseek-v4-flash"        # default model for this provider
+model_prefix = "opencode/"                  # route: model starts with "opencode/" -> here
+thinking = true
+reasoning_efforts = ["low", "high", "max"]
+default_reasoning_effort = "high"
+
+# Optional per-provider pricing (omitted below -> no cost estimate for zen):
+# [backend.openai.providers.opencode-zen.cost]
+# input = ...
+# output = ...
+
+[backend.openai.providers.opencode-zen.model_context_windows]
+"opencode/deepseek-v4-flash" = 1048576
+"opencode/deepseek-v4-pro" = 1048576
+
+# To add yet another provider, just append another table, e.g.:
+# [backend.openai.providers.groq]
+# base_url = "https://api.groq.com/openai/v1"
+# api_key = "${GROQ_API_KEY}"
+# model = "groq/llama-3.3-70b-versatile"
+# model_prefix = "groq/"
+# [backend.openai.providers.groq.model_context_windows]
+# "groq/llama-3.3-70b-versatile" = 131072

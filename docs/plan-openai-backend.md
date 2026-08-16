@@ -52,6 +52,9 @@
 
 配置入口(`~/.grok/codex-oauth/proxy.toml`):
 
+> 完整示例见 `plugin/assets/proxy.toml.example`(DeepSeek Responses + opencode zen Chat,
+> 含 `wire_format` / `compat` / `cache_policy` / `cost` 注释)。
+
 ```toml
 [backend.openai]
 base_url = "https://api.deepseek.com/v1"
