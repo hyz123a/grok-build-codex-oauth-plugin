@@ -26,7 +26,10 @@ fn setup_is_idempotent_and_preserves_unrelated_configuration() {
     assert!(second.contains("base_url = \"http://127.0.0.1:1456/v1\""));
     assert!(second.contains("api_key = \"secret-1\""));
     assert!(second.contains("supports_backend_search = true"));
-    assert!(second.contains("[models]\nweb_search = \"codex\""));
+    assert!(
+        !second.contains("web_search"),
+        "the plugin must not pin a web_search model"
+    );
     assert!(path.with_extension("toml.bak").exists());
 }
 
@@ -69,7 +72,10 @@ fn catalog_installs_selectable_codex_model_aliases() {
         assert!(result.contains(&format!("model = \"{model}\"")));
     }
     assert!(result.contains("supports_backend_search = true"));
-    assert!(result.contains("[models]\nweb_search = \"codex-sol\""));
+    assert!(
+        !result.contains("web_search"),
+        "the plugin must not pin a web_search model"
+    );
 }
 
 #[test]

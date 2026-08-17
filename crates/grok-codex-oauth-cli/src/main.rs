@@ -1,7 +1,7 @@
 #[cfg(target_os = "linux")]
 use std::os::unix::ffi::OsStrExt;
 use std::{
-    collections::{HashMap, VecDeque},
+    collections::{HashMap, HashSet, VecDeque},
     fs,
     io::{BufRead, BufReader, Seek, SeekFrom, Write},
     net::SocketAddr,
@@ -28,8 +28,8 @@ use codex_oauth::{
     build_authorize_url, generate_state, validate_callback,
 };
 use codex_proxy::{
-    CredentialProvider, OpenAIBackends, ProxyConfig, StoredCredentialProvider, build_router,
-    system_prompt_policy_fingerprint, websocket_proxy_configured_from_env,
+    CODEX_ROUTE_PREFIX, CredentialProvider, OpenAIBackends, ProxyConfig, StoredCredentialProvider,
+    build_router, system_prompt_policy_fingerprint, websocket_proxy_configured_from_env,
 };
 use directories::BaseDirs;
 use fs2::FileExt;
@@ -284,59 +284,89 @@ async fn sync_models(paths: &AppPaths) -> Result<()> {
     let cached = load_cached_catalog(&paths.models_cache)?;
     let previous_aliases = managed_aliases(cached.as_deref());
 
-    // OpenAI-compatible backends: sync each provider's own model list from its
-    // `/models` endpoint instead of the Codex OAuth catalog.
-    if let Some(backends) = load_openai_backends(paths)? {
-        return sync_openai_models(paths, &config, &previous_aliases, &backends).await;
-    }
+    let mut models: Vec<CatalogModel> = Vec::new();
+    let mut sources: Vec<String> = Vec::new();
 
+    // Source 1: the signed-in ChatGPT account's Codex catalog. This is
+    // best-effort: a missing/expired credential (or an offline network) must
+    // not wipe out the OpenAI-compatible models, so failures reduce to a
+    // warning here and only fall through to the fallback catalog below when
+    // every source comes up empty.
     let provider = StoredCredentialProvider::new(
         Arc::new(paths.store()),
         OAuthClient::new(OAuthConfig::default()),
     );
     let client_version = discover_codex_client_version();
-    let remote = match provider.access_credential().await {
+    match provider.access_credential().await {
         Ok(credential) => {
-            ModelCatalogClient::production(&client_version)?
-                .fetch(&credential)
-                .await
+            // Building the client and fetching are both fallible; each is
+            // treated as best-effort so a transient failure never aborts the
+            // OpenAI-compatible half of the sync.
+            let account_remote = match ModelCatalogClient::production(&client_version) {
+                Ok(client) => client.fetch(&credential).await,
+                Err(error) => Err(codex_models::CatalogError::Authentication(format!(
+                    "could not build the model catalog client: {error}"
+                ))),
+            };
+            match account_remote {
+                Ok(remote) if !remote.is_empty() => {
+                    // Account/Codex-server models are routed to the built-in
+                    // Codex backend via a reserved prefix, so their Grok
+                    // `model` values never collide with a provider's bare ids.
+                    let account = remote
+                        .into_iter()
+                        .map(|mut model| {
+                            model.route_prefix = Some(CODEX_ROUTE_PREFIX.to_string());
+                            model
+                        })
+                        .collect::<Vec<_>>();
+                    sources.push("the signed-in ChatGPT account".to_string());
+                    models.extend(account);
+                }
+                Ok(_) => eprintln!("warning: the account catalog returned no selectable models"),
+                Err(error) => eprintln!("warning: could not fetch the account catalog ({error})"),
+            }
         }
-        Err(error) => Err(codex_models::CatalogError::Authentication(error)),
-    };
-
-    match remote {
-        Ok(models) if !models.is_empty() => {
-            install_discovered_models(&paths.grok_config, &config, &models, &previous_aliases)?;
-            save_cached_catalog(&paths.models_cache, &models)?;
-            println!(
-                "Synced {} selectable Codex models from the signed-in ChatGPT account.",
-                models.len()
-            );
-        }
-        Ok(_) => {
-            install_fallback_catalog(paths, &config, cached.as_deref(), &previous_aliases)?;
-            eprintln!(
-                "warning: the remote catalog had no selectable models; used fallback catalog"
-            );
-        }
-        Err(error) => {
-            install_fallback_catalog(paths, &config, cached.as_deref(), &previous_aliases)?;
-            eprintln!("warning: model sync failed ({error}); used fallback catalog");
-        }
+        Err(error) => eprintln!("warning: could not read the login credential ({error})"),
     }
+
+    // Source 2: any configured OpenAI-compatible backends.
+    if let Some(backends) = load_openai_backends(paths)? {
+        let openai = fetch_openai_models(&backends).await?;
+        sources.extend(
+            backends
+                .all()
+                .map(|provider| provider.base_url.trim_end_matches('/').to_string()),
+        );
+        models.extend(openai);
+    }
+
+    // Deduplicate by slug (an id may appear under several providers).
+    let mut seen = HashSet::new();
+    models.retain(|model| seen.insert(model.slug.clone()));
+
+    if models.is_empty() {
+        // Every source failed or returned nothing: fall back to cache/built-in.
+        install_fallback_catalog(paths, &config, cached.as_deref(), &previous_aliases)?;
+        eprintln!("warning: no selectable models were available from any source; used the fallback catalog");
+        return Ok(());
+    }
+
+    install_discovered_models(&paths.grok_config, &config, &models, &previous_aliases)?;
+    save_cached_catalog(&paths.models_cache, &models)?;
+    println!(
+        "Synced {} selectable Codex models ({}).",
+        models.len(),
+        sources.join(", ")
+    );
     Ok(())
 }
 
-/// Fetch each OpenAI-compatible provider's `/models` list and install them as
-/// selectable Grok models (`[model.codex-*]`), replacing prior managed entries.
+/// Fetch each OpenAI-compatible provider's `/models` list as `CatalogModel`s.
 /// Named providers have their model ids prefixed (e.g. `opencode/...`) so their
-/// Grok aliases never collide with the default provider's.
-async fn sync_openai_models(
-    paths: &AppPaths,
-    config: &ModelConfig,
-    previous_aliases: &[String],
-    backends: &OpenAIBackends,
-) -> Result<()> {
+/// Grok aliases never collide with the default provider's. No model state is
+/// installed here; the caller merges the result with the account catalog.
+async fn fetch_openai_models(backends: &OpenAIBackends) -> Result<Vec<CatalogModel>> {
     let mut models = Vec::new();
     for provider in backends.all() {
         let url = format!("{}/models", provider.base_url.trim_end_matches('/'));
@@ -397,24 +427,11 @@ async fn sync_openai_models(
                 slug,
                 default_reasoning_effort,
                 supported_reasoning_efforts,
+                route_prefix: None,
             });
         }
     }
-
-    if models.is_empty() {
-        install_fallback_catalog(paths, config, None, previous_aliases)?;
-        eprintln!("warning: the openai providers returned no models; used fallback catalog");
-        return Ok(());
-    }
-    install_discovered_models(&paths.grok_config, config, &models, previous_aliases)?;
-    save_cached_catalog(&paths.models_cache, &models)?;
-    let sources = backends
-        .all()
-        .map(|provider| provider.base_url.trim_end_matches('/'))
-        .collect::<Vec<_>>()
-        .join(", ");
-    println!("Synced {} selectable models from {}.", models.len(), sources);
-    Ok(())
+    Ok(models)
 }
 
 fn discover_codex_client_version() -> String {
@@ -475,7 +492,13 @@ fn install_discovered_models(
         .iter()
         .map(|model| SelectableModel {
             alias: model_alias(&model.slug),
-            model: model.slug.clone(),
+            // Account/Codex-server models carry their route prefix so the proxy
+            // can tell them apart from OpenAI-compatible models and route them
+            // to the built-in Codex backend (the prefix is stripped upstream).
+            model: match model.route_prefix.as_deref() {
+                Some(prefix) => format!("{prefix}{}", model.slug),
+                None => model.slug.clone(),
+            },
             display_name: format!("Codex {}", model.display_name),
             context_window: model.context_window,
             default_reasoning_effort: model.default_reasoning_effort.clone(),

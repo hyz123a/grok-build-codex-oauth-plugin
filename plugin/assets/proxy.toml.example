@@ -9,6 +9,16 @@
 # changes. Remove the `[backend.openai]` section (or the file) to go back to the
 # default Codex OAuth backend.
 #
+# Coexistence ("codex server" + OpenAI-compatible): when this file is present the
+# proxy serves BOTH the signed-in ChatGPT account's Codex models and these
+# providers. `grok-codex-oauth models sync` merges the account catalog with each
+# provider's /models list into one Grok model picker. Account/Codex-server models
+# are installed with a reserved `codex/` routing prefix (e.g. `codex/gpt-5.6-sol`);
+# the proxy routes any request whose model starts with `codex/` to the built-in
+# Codex backend and strips the prefix upstream. Everything else routes exactly as
+# described below (named `model_prefix` match wins, otherwise the default
+# provider). Do not name any of your own providers with a `codex/` prefix.
+#
 # Two wire formats are supported per provider (`wire_format`):
 #   - "chat-completions" (default): Grok's Responses body is translated to an
 #     OpenAI Chat request at `{base_url}/chat/completions`.

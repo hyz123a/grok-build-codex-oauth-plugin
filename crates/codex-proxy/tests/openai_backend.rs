@@ -710,3 +710,108 @@ async fn health_reports_openai_providers_with_cost() {
     assert_eq!(providers[0]["cost"]["input"], 0.27);
     assert_eq!(providers[0]["cost"]["output"], 1.10);
 }
+
+async fn codex_upstream(State(captures): State<Captures>, body: String) -> Response {
+    let value: Value = serde_json::from_str(&body).expect("json");
+    captures.0.lock().expect("captures").push(value);
+    Response::builder()
+        .status(StatusCode::OK)
+        .header("content-type", "text/event-stream")
+        .body(Body::from("data: {\"type\":\"response.completed\"}\n\n"))
+        .expect("response")
+}
+
+async fn spawn_codex_upstream(captures: Captures) -> String {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind");
+    let address = listener.local_addr().expect("addr");
+    tokio::spawn(async move {
+        axum::serve(
+            listener,
+            Router::new()
+                .route("/responses", post(codex_upstream))
+                .with_state(captures),
+        )
+        .await
+        .expect("server");
+    });
+    format!("http://{address}/responses")
+}
+
+#[tokio::test]
+async fn codex_route_prefix_serves_codex_backend_alongside_openai() {
+    let codex_captures = Captures::default();
+    let codex_url = spawn_codex_upstream(codex_captures.clone()).await;
+    let openai_captures = Captures::default();
+    let openai_url = spawn_openai_upstream(openai_captures.clone()).await;
+
+    let mut deepseek = openai_config(openai_url.clone());
+    deepseek.default_model = Some("deepseek-v4-flash".into());
+    let mut zen = openai_config(openai_url.clone());
+    zen.name = Some("opencode-zen".into());
+    zen.model_prefix = Some("opencode/".into());
+    zen.default_model = Some("opencode/deepseek-v4-flash".into());
+
+    let app = build_router(
+        ProxyConfig::for_test(codex_url, "local-secret").with_openai_backends(OpenAIBackends {
+            default: Some(deepseek),
+            named: vec![zen],
+        }),
+        Arc::new(StubCredentials::default()),
+    )
+    .expect("router");
+
+    // A Codex-server (account) model routes to the built-in Codex backend with
+    // the reserved `codex/` prefix stripped before going upstream.
+    let _ = tower::ServiceExt::oneshot(
+        app.clone(),
+        axum::http::Request::post("/v1/responses")
+            .header("authorization", "Bearer local-secret")
+            .header("content-type", "application/json")
+            .body(Body::from(r#"{"model":"codex/gpt-5.6-sol","input":[]}"#))
+            .expect("request"),
+    )
+    .await
+    .expect("response");
+
+    let codex = codex_captures.0.lock().expect("codex captures");
+    assert_eq!(
+        codex.len(),
+        1,
+        "codex-prefixed model must reach the Codex backend"
+    );
+    assert_eq!(
+        codex[0]["model"], "gpt-5.6-sol",
+        "codex route prefix must be stripped before upstream"
+    );
+    assert!(
+        openai_captures.0.lock().expect("openai captures").is_empty(),
+        "codex-prefixed model must not reach an OpenAI provider"
+    );
+    drop(codex);
+
+    // An un-prefixed model (e.g. the default DeepSeek provider) still routes to
+    // OpenAI even while the account Codex backend is available.
+    let _ = tower::ServiceExt::oneshot(
+        app.clone(),
+        axum::http::Request::post("/v1/responses")
+            .header("authorization", "Bearer local-secret")
+            .header("content-type", "application/json")
+            .body(Body::from(r#"{"model":"deepseek-v4-flash","input":[]}"#))
+            .expect("request"),
+    )
+    .await
+    .expect("response");
+
+    let openai = openai_captures.0.lock().expect("openai captures");
+    assert!(
+        !openai.is_empty(),
+        "un-prefixed model must route to an OpenAI provider"
+    );
+    assert_eq!(
+        codex_captures.0.lock().expect("codex captures").len(),
+        1,
+        "the Codex backend must not receive un-prefixed OpenAI models"
+    );
+}

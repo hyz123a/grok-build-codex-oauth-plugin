@@ -40,6 +40,13 @@ pub use crate::config::{
 };
 
 pub const CODEX_RESPONSES_URL: &str = "https://chatgpt.com/backend-api/codex/responses";
+
+/// Reserved model-name prefix that routes a request to the built-in Codex
+/// backend (the signed-in ChatGPT account) even when OpenAI-compatible
+/// backends are configured. The prefix is stripped before forwarding upstream;
+/// the account's catalog models are installed with this prefix so they never
+/// collide with a provider's bare model ids (coexistence mode).
+pub const CODEX_ROUTE_PREFIX: &str = "codex/";
 const DEFAULT_BODY_LIMIT: usize = 16 * 1024 * 1024;
 const DEFAULT_MAX_CONCURRENCY: usize = 4;
 const DEFAULT_WEBSOCKET_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
@@ -645,6 +652,21 @@ async fn proxy_responses(
         }
     }
     if state.config.openai_backend.is_some() || !state.config.openai_named_backends.is_empty() {
+        // Coexistence: a model carrying the reserved Codex route prefix is served
+        // by the built-in Codex backend (the signed-in ChatGPT account), even when
+        // OpenAI-compatible backends are also configured. Strip the prefix before
+        // forwarding so the account's upstream sees the real model id.
+        let account_model = {
+            let requested_model = parsed.get("model").and_then(Value::as_str);
+            requested_model
+                .and_then(|model| model.strip_prefix(CODEX_ROUTE_PREFIX))
+                .map(str::to_owned)
+        };
+        if let Some(account_model) = account_model {
+            let mut routed = parsed;
+            routed["model"] = Value::String(account_model);
+            return backend::codex::handle_codex(&state, &headers, routed, request_started_at).await;
+        }
         let client_request_id = headers
             .get("x-request-id")
             .and_then(|value| value.to_str().ok())

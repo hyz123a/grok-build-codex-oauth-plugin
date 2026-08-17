@@ -25,6 +25,14 @@ pub struct CatalogModel {
     pub default_reasoning_effort: Option<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub supported_reasoning_efforts: Vec<String>,
+    /// When set (e.g. `"codex/"`), the Grok `model` value sent to the proxy is
+    /// `{route_prefix}{slug}`. The proxy routes any request whose model starts
+    /// with this prefix to the built-in Codex backend (the signed-in ChatGPT
+    /// account) and strips the prefix before forwarding upstream. OpenAI
+    /// compatible-provider models leave this `None`; their routing prefix is
+    /// already embedded in `slug`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub route_prefix: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -77,6 +85,7 @@ pub fn parse_visible_models(bytes: &[u8]) -> Result<Vec<CatalogModel>, CatalogEr
                 .into_iter()
                 .map(|level| level.effort)
                 .collect(),
+            route_prefix: None,
         })
         .collect())
 }

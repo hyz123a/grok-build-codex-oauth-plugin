@@ -68,6 +68,7 @@ fn catalog_keeps_only_visible_api_models_and_sorts_by_priority() {
                 context_window: None,
                 default_reasoning_effort: None,
                 supported_reasoning_efforts: Vec::new(),
+                route_prefix: None,
             },
             CatalogModel {
                 slug: "gpt-5.7".into(),
@@ -82,6 +83,7 @@ fn catalog_keeps_only_visible_api_models_and_sorts_by_priority() {
                     "max".into(),
                     "ultra".into(),
                 ],
+                route_prefix: None,
             },
         ]
     );
@@ -167,6 +169,7 @@ fn cached_catalog_round_trips_with_private_permissions() {
         context_window: Some(300_000),
         default_reasoning_effort: Some("medium".into()),
         supported_reasoning_efforts: vec!["low".into(), "medium".into(), "high".into()],
+        route_prefix: None,
     }];
 
     save_cached_catalog(&path, &models).expect("save cache");
