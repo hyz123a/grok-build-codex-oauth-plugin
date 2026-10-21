@@ -82,6 +82,12 @@ impl CodexSseTransformer {
             self.filtered_keepalive_events = self.filtered_keepalive_events.saturating_add(1);
             return None;
         }
+        // Grok's Responses event decoder rejects this upstream control event
+        // as an unknown enum variant. It carries metadata rather than response
+        // content, so keep it out of the client-facing stream.
+        if event.get("type").and_then(Value::as_str) == Some("response.metadata") {
+            return None;
+        }
         let changed = self.observe_event(&mut event);
         if changed {
             Some(format!("data: {event}\n\n").into_bytes())

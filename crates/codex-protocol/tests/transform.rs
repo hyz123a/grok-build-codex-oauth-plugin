@@ -394,3 +394,23 @@ data: {"type":"response.in_progress","response":{"id":"resp-1"}}
     assert_eq!(bridge.take_filtered_keepalive_events(), 1);
     assert_eq!(bridge.take_filtered_keepalive_events(), 0);
 }
+
+#[test]
+fn sse_bridge_drops_response_metadata_without_dropping_response_events() {
+    let mut bridge = CodexSseTransformer::default();
+    let stream = br#"data: {"type":"response.created","response":{"id":"resp-1"}}
+
+data: {"type":"response.metadata","metadata":{"internal":"value"}}
+
+data: {"type":"response.in_progress","response":{"id":"resp-1"}}
+
+"#;
+
+    let mut output = bridge.push(stream);
+    output.extend(bridge.finish());
+    let output = String::from_utf8(output.concat()).expect("utf8 SSE");
+
+    assert!(output.contains(r#""type":"response.created""#));
+    assert!(output.contains(r#""type":"response.in_progress""#));
+    assert!(!output.contains(r#""type":"response.metadata""#));
+}
